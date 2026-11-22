@@ -29,7 +29,8 @@ const stop = document.getElementById("stop");
 const target = document.getElementById("target");
 
 // Each agent's context, by agent name, rebuilt from the JSON Patches Bip
-// streams. `main` is the primary agent; subagents are `sub-1`, `sub-2`, ...
+// streams. `main` is the primary agent; subagents are named by short IDs,
+// like `4C1D7A`.
 let agents;
 
 // Apply one JSON Patch (RFC 6902) operation to `state`. Bip only sends add,

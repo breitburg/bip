@@ -48,9 +48,9 @@ the agent they're for in `agent`, and go to `main` when they name none.
 
 ```json
 {"type": "message", "data": {"text": "Hey Bip!"}}
-{"type": "message", "data": {"text": "Focus on the tests", "agent": "sub-1"}}
+{"type": "message", "data": {"text": "Focus on the tests", "agent": "4C1D7A"}}
 {"type": "stop"}
-{"type": "stop", "data": {"agent": "sub-2"}}
+{"type": "stop", "data": {"agent": "0B3E95"}}
 {"type": "clear"}
 ```
 
@@ -101,10 +101,10 @@ Interface::new("agents", DOCS).function("spawn", |_, agent, task: String| { ... 
 ```
 
 Every output names the agent it belongs to: `main` for the primary agent, and
-`sub-1`, `sub-2`, ... for subagents, in the order they started. Clients get
+a 6-character ID, like a message's (`4C1D7A`), for each subagent. Clients get
 every agent's changes, so they can show what each one is doing. Each agent's
 context is separate and starts empty. Clients can message and stop any agent
-by name. Names are unique until a `clear`, which starts numbering over.
+by name. No two running agents share a name.
 A subagent starts as soon as `agents.spawn` is called. When it finishes, or a `clear`,
 a `stop` or `agents.stop` stops it, Bip sends `finished` for it: it's gone, and so is its context.
 
@@ -145,14 +145,14 @@ falls far behind (256 outputs) misses the ones it couldn't keep up with.
   "content": "Hey Ilia! What's up?",
   "time": "2026-11-22T01:47:53.964114Z",
   "tool_calls": [
-    {"id": "call_1", "name": "lua", "arguments": "{\"code\": \"agents.spawn(...)\"}", "result": "sub-1"}
+    {"id": "call_1", "name": "lua", "arguments": "{\"code\": \"agents.spawn(...)\"}", "result": "4C1D7A"}
   ]
 }
 ```
 
 - `id`: 6 characters, unique within the context and stable for the message's
   life.
-- `role`: `"user"`, `"assistant"`, or `{"agent": "sub-1"}` for a message from
+- `role`: `"user"`, `"assistant"`, or `{"agent": "4C1D7A"}` for a message from
   another agent: a subagent's report, or the task a subagent was given.
 - `time`: when the message joined the context.
 - `tool_calls`: tools the assistant called in this message; the only tool is

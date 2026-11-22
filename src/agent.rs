@@ -23,7 +23,7 @@ const MAX_STEPS: usize = 5;
 pub enum Output {
     /// A change to one agent's context, as a JSON Patch. Applying an agent's
     /// patches in order to `{"messages": {}, "order": []}` rebuilds its
-    /// conversation. The primary agent is `main`; subagents are `sub-1`, ...
+    /// conversation. The primary agent is `main`; subagents are named by short IDs, like `4C1D7A`.
     Change { agent: String, patch: Patch },
     /// Something went wrong in one agent's turn. The agent keeps running.
     Error { agent: String, message: String },
@@ -52,7 +52,7 @@ pub enum Input {
 /// One agent, primary or subagent: its name, how it reaches the model, the
 /// conversation it sees, and what it can do.
 pub struct Agent {
-    /// `main`, or `sub-N` for a subagent. Outputs and logs carry it.
+    /// `main`, or a short ID like `4C1D7A` for a subagent. Outputs and logs carry it.
     pub name: String,
     pub client: Client<OpenAIConfig>,
     pub model: String,

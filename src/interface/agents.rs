@@ -5,7 +5,7 @@ const DOCS: &str = "\
 `agents` starts and stops subagents.
 
 - `agents.spawn(task)`: start a subagent that works on `task`, a string, in
-  the background, and return its name at once, like `sub-1`. When the
+  the background, and return its name at once, a short ID like `4C1D7A`. When the
   subagent finishes, its final reply arrives as a message from it, marked
   with that name. The subagent starts with an empty conversation and sees
   nothing of this one, so `task` must hold everything it needs to know. It
@@ -18,7 +18,7 @@ const DOCS: &str = "\
 pub fn interface() -> Interface {
     Interface::new("agents", DOCS)
         .function("spawn", |_, agent, task: String| {
-            let name = agent.swarm.next_name();
+            let name = agent.swarm.new_name();
             // Another agent with the same setup, running in the background. Its
             // last reply comes back as a message from it.
             let (child, inputs) = Agent::new(

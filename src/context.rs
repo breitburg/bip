@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use json_patch::Patch;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 
 /// Who wrote a message.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -53,7 +53,7 @@ pub const TIME_FORMAT: &str = "%FT%TZ";
 impl Message {
     /// The message as the model sees it: a `<metadata>` tag, then the text on
     /// the next line. A message from another agent also says who it's from:
-    /// `from="sub-1"`. Each tool call is followed by its result, as plain text.
+    /// `from="4C1D7A"`. Each tool call is followed by its result, as plain text.
     ///
     /// ```text
     /// <metadata id="0E9258" time="2026-11-22T01:47:53Z"/>
@@ -116,8 +116,6 @@ impl Message {
 /// removing one doesn't resend every message after it.
 pub struct Context {
     messages: Vec<Message>,
-    /// How many messages were ever added, which makes each new ID different.
-    added: u64,
     publish: Box<dyn Fn(Patch) + Send + Sync>,
 }
 
@@ -127,7 +125,6 @@ impl Context {
     pub fn new(publish: impl Fn(Patch) + Send + Sync + 'static) -> Self {
         Self {
             messages: Vec::new(),
-            added: 0,
             publish: Box::new(publish),
         }
     }
@@ -143,18 +140,7 @@ impl Context {
 
     /// Add a message at the end and return its index.
     pub fn push(&mut self, role: Role, content: impl Into<String>) -> usize {
-        // The ID only has to be short, unique here, and unlike its neighbours,
-        // so the model doesn't mix them up. Re-hash on the rare collision.
-        let mut hasher = DefaultHasher::new();
-        self.added += 1;
-        self.added.hash(&mut hasher);
-        let id = loop {
-            let id = format!("{:06X}", hasher.finish() & 0xFF_FFFF);
-            if self.messages.iter().all(|m| m.id != id) {
-                break id;
-            }
-            id.hash(&mut hasher);
-        };
+        let id = short_id(|id| self.messages.iter().any(|m| m.id == id));
         let message = Message {
             id,
             role,
@@ -242,6 +228,22 @@ impl Context {
             .collect();
         let order: Vec<&str> = self.messages.iter().map(|m| m.id.as_str()).collect();
         json!({ "messages": messages, "order": order })
+    }
+}
+
+/// A new 6-character ID, like `0E9258`, for which `taken` is false. IDs only
+/// have to be short, unique where they're used, and unlike their neighbours,
+/// so the model doesn't mix them up: random ones are. Messages and agents
+/// both get theirs here.
+pub fn short_id(taken: impl Fn(&str) -> bool) -> String {
+    let mut hasher = RandomState::new().build_hasher();
+    loop {
+        let id = format!("{:06X}", hasher.finish() & 0xFF_FFFF);
+        if !taken(&id) {
+            return id;
+        }
+        // Re-hash on the rare collision.
+        id.hash(&mut hasher);
     }
 }
 

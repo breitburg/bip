@@ -1,4 +1,5 @@
 use crate::agent::Input;
+use crate::context::short_id;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -44,9 +45,6 @@ pub struct Swarm(Arc<Mutex<Registry>>);
 #[derive(Default)]
 struct Registry {
     agents: HashMap<String, Member>,
-    /// How many subagents have started since the last clear; the next is
-    /// `sub-{spawned + 1}`.
-    spawned: usize,
 }
 
 struct Member {
@@ -76,12 +74,11 @@ impl Swarm {
         inbox.send(input).await.map_err(|_| format!("{agent} has finished"))
     }
 
-    /// The name for the next subagent: `sub-1`, `sub-2`, ... Numbers restart
-    /// after a clear, which forgets every subagent.
-    pub fn next_name(&self) -> String {
-        let mut registry = self.lock();
-        registry.spawned += 1;
-        format!("sub-{}", registry.spawned)
+    /// A name for a new subagent: a short ID, like a message's, that no
+    /// running agent has.
+    pub fn new_name(&self) -> String {
+        let registry = self.lock();
+        short_id(|id| registry.agents.contains_key(id))
     }
 
     pub fn join(&self, name: &str, inbox: mpsc::Sender<Input>, parent: Option<String>) {
@@ -149,11 +146,10 @@ impl Swarm {
     }
 
     /// End every subagent, and wait until they're really gone, so nothing
-    /// they send comes after. Numbering starts over.
+    /// they send comes after.
     pub async fn kill_subagents(&self) {
         let tasks: Vec<_> = {
             let mut registry = self.lock();
-            registry.spawned = 0;
             let names: Vec<_> = registry.agents.keys().filter(|n| *n != MAIN).cloned().collect();
             let members = names.iter().filter_map(|n| registry.agents.remove(n));
             members.filter_map(|m| m.task).collect()
@@ -179,13 +175,13 @@ mod tests {
     fn commands_default_to_main() {
         assert!(matches!(parse(r#"{"type":"message","data":{"text":"hi"}}"#),
             Command::Message { agent, .. } if agent == MAIN));
-        assert!(matches!(parse(r#"{"type":"message","data":{"text":"hi","agent":"sub-2"}}"#),
-            Command::Message { agent, .. } if agent == "sub-2"));
+        assert!(matches!(parse(r#"{"type":"message","data":{"text":"hi","agent":"4C1D7A"}}"#),
+            Command::Message { agent, .. } if agent == "4C1D7A"));
         assert!(matches!(parse(r#"{"type":"stop"}"#), Command::Stop(None)));
         assert!(matches!(parse(r#"{"type":"stop","data":{}}"#),
             Command::Stop(Some(Target { agent })) if agent == MAIN));
-        assert!(matches!(parse(r#"{"type":"stop","data":{"agent":"sub-1"}}"#),
-            Command::Stop(Some(Target { agent })) if agent == "sub-1"));
+        assert!(matches!(parse(r#"{"type":"stop","data":{"agent":"0B3E95"}}"#),
+            Command::Stop(Some(Target { agent })) if agent == "0B3E95"));
         assert!(matches!(parse(r#"{"type":"clear"}"#), Command::Clear));
     }
 }
