@@ -1,6 +1,7 @@
 use crate::context::{Call, Context, METADATA, Role};
 use crate::interface::{Error, Interface};
 use crate::lua;
+use crate::swarm::Swarm;
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -10,7 +11,6 @@ use futures::{FutureExt, StreamExt, future::BoxFuture};
 use json_patch::Patch;
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 /// How many times one turn may call the model before it's given up on.
@@ -34,22 +34,19 @@ pub enum Output {
     Cleared,
 }
 
-/// What the agent accepts. Clients send these as JSON; the protocol is
-/// documented in README.md.
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+/// What an agent accepts, through its inbox in the swarm. Clients' commands
+/// become these.
+#[derive(Debug)]
 pub enum Input {
     /// A message for this agent: from a person, or from the agent named in
     /// `from`, like a subagent reporting back.
-    Message {
-        text: String,
-        /// Set only by agents; clients can't claim to be one.
-        #[serde(skip_deserializing)]
-        from: Option<String>,
-    },
+    Message { text: String, from: Option<String> },
     /// Remove every message from the context, and stop and clear every
     /// subagent. Unlike a message, this doesn't wait for the turn to end.
     Clear,
+    /// Stop what this agent is doing, at once: its turn ends where it is, and
+    /// its subagents are stopped. The context stays as it is.
+    Stop,
 }
 
 /// One agent, primary or subagent: its name, how it reaches the model, the
@@ -69,26 +66,37 @@ pub struct Agent {
     pub context: Context,
     /// This agent's Luau runtime, started by its first script.
     pub lua: Option<mlua::Lua>,
-    /// A way to this agent's own inputs, handed to subagents so they can
-    /// report back.
-    pub inbox: mpsc::Sender<Input>,
+    /// Every running agent, this one included, reachable by name.
+    pub swarm: Swarm,
     /// Who started this agent, to report to when it's done. None for `main`.
-    parent: Option<mpsc::Sender<Input>>,
-    /// The subagents this agent started, each running on its own.
-    pub children: Vec<JoinHandle<()>>,
+    parent: Option<String>,
+}
+
+/// How a subagent's work ended, for its report.
+enum Ending {
+    Replied,
+    Failed(String),
+    Stopped,
 }
 
 /// However an agent goes, by finishing or by being stopped, it says so as
 /// the last thing it does.
 impl Drop for Agent {
     fn drop(&mut self) {
+        // A stopped agent's subagents would otherwise run on with no one to
+        // report to.
+        for child in self.swarm.children(&self.name) {
+            self.swarm.kill(&child);
+        }
+        self.swarm.leave(&self.name);
         let agent = self.name.clone();
         let _ = self.outputs.send(Output::Finished { agent });
     }
 }
 
 impl Agent {
-    /// A new agent, and the inputs to `run` it on.
+    /// A new agent, already in the swarm, and the inputs to `run` it on.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         client: Client<OpenAIConfig>,
@@ -96,9 +104,11 @@ impl Agent {
         system_prompt: String,
         outputs: mpsc::UnboundedSender<Output>,
         interfaces: Vec<Interface>,
-        parent: Option<mpsc::Sender<Input>>,
+        parent: Option<String>,
+        swarm: Swarm,
     ) -> (Self, mpsc::Receiver<Input>) {
         let (inbox, inputs) = mpsc::channel(8);
+        swarm.join(&name, inbox, parent.clone());
         let (agent, publish) = (name.clone(), outputs.clone());
         let context = Context::new(move |patch| {
             let agent = agent.clone();
@@ -113,16 +123,16 @@ impl Agent {
             interfaces,
             context,
             lua: None,
-            inbox,
+            swarm,
             parent,
-            children: Vec::new(),
         };
         (agent, inputs)
     }
 
     /// Handle inputs in order, forever for `main`. A subagent stops once it
     /// has nothing left to do and none of its own subagents is running, and
-    /// sends its last reply to its parent as a message.
+    /// sends its last reply to its parent as a message. A subagent that's
+    /// stopped says so instead.
     ///
     /// Boxed, because a subagent's `run` is started from inside its parent's
     /// `run`, and only a boxed future can contain itself.
@@ -131,11 +141,12 @@ impl Agent {
         async move {
             // Messages that arrived during a turn, waiting for it to end.
             let mut queued = VecDeque::new();
-            let mut failure = None;
+            let mut ending = Ending::Replied;
             loop {
                 let idle = queued.is_empty() && inputs.is_empty();
-                // A finished subagent's report is already in `inputs`.
-                if idle && self.parent.is_some() && self.children.iter().all(|c| c.is_finished()) {
+                // A finished subagent's report is already in `inputs`: it
+                // reports before it leaves the swarm.
+                if idle && self.parent.is_some() && self.swarm.children(&self.name).is_empty() {
                     break;
                 }
                 let input = match queued.pop_front() {
@@ -153,26 +164,32 @@ impl Agent {
                         self.clear().await;
                         continue;
                     }
+                    Input::Stop => {
+                        self.stop();
+                        ending = Ending::Stopped;
+                        continue;
+                    }
                 }
 
-                // A clear stops the turn where it is; dropping `turn` does that.
+                // A clear or a stop ends the turn where it is; dropping `turn`
+                // does that.
                 let result = {
                     let turn = self.respond();
                     tokio::pin!(turn);
                     loop {
                         tokio::select! {
-                            result = &mut turn => break Some(result),
+                            result = &mut turn => break Ok(result),
                             input = inputs.recv() => match input {
-                                Some(Input::Clear) => break None,
+                                Some(interrupt @ (Input::Clear | Input::Stop)) => break Err(interrupt),
                                 Some(message) => queued.push_back(message),
                                 None => {} // only `main` can lose its senders
                             },
                         }
                     }
                 };
-                failure = match result {
-                    Some(Ok(())) => None,
-                    Some(Err(e)) => {
+                ending = match result {
+                    Ok(Ok(())) => Ending::Replied,
+                    Ok(Err(e)) => {
                         let message = e.to_string();
                         warn!(%message, "turn failed");
                         let agent = self.name.clone();
@@ -180,20 +197,33 @@ impl Agent {
                             agent,
                             message: message.clone(),
                         });
-                        Some(message)
+                        Ending::Failed(message)
                     }
-                    None => {
+                    Err(Input::Stop) => {
+                        self.stop();
+                        // Messages that waited for the turn join the context,
+                        // but answering them now would undo the stop. The
+                        // next message answers them too.
+                        for input in queued.drain(..) {
+                            if let Input::Message { text, from } = input {
+                                self.context.push(from.map_or(Role::User, Role::Agent), text);
+                            }
+                        }
+                        Ending::Stopped
+                    }
+                    Err(_) => {
                         // Messages from before the clear are cleared with it.
                         queued.clear();
                         self.clear().await;
-                        None
+                        Ending::Replied
                     }
                 };
             }
-            if let Some(parent) = self.parent.take() {
-                let text = match failure {
-                    Some(message) => format!("(failed: {message})"),
-                    None => self.last_reply(),
+            if let Some(parent) = self.parent.take().and_then(|p| self.swarm.inbox(&p)) {
+                let text = match ending {
+                    Ending::Replied => self.last_reply(),
+                    Ending::Failed(message) => format!("(failed: {message})"),
+                    Ending::Stopped => format!("(stopped) {}", self.last_reply()),
                 };
                 let from = Some(self.name.clone());
                 let _ = parent.send(Input::Message { text, from }).await;
@@ -212,14 +242,30 @@ impl Agent {
             .unwrap_or_else(|| "(finished without replying)".into())
     }
 
+    /// Stop the subagents and tidy up after a turn that was cut short. What
+    /// the model had said so far stays.
+    fn stop(&mut self) {
+        info!("stopping");
+        for child in self.swarm.children(&self.name) {
+            self.swarm.kill(&child);
+        }
+        // A reply that hadn't started is no reply.
+        let messages = self.context.messages();
+        if let Some((last, before)) = messages.split_last()
+            && last.role == Role::Assistant
+            && last.content.is_empty()
+            && last.tool_calls.is_empty()
+        {
+            self.context.replace(before.to_vec());
+        }
+    }
+
     async fn clear(&mut self) {
         info!("clearing context");
-        // Wait until the subagents are really gone, so `Cleared` comes after
+        // Only `main` is sent a clear, and it clears the whole swarm. Wait
+        // until the subagents are really gone, so `Cleared` comes after
         // everything they sent.
-        for child in self.children.drain(..) {
-            child.abort();
-            let _ = child.await;
-        }
+        self.swarm.kill_subagents().await;
         self.context.replace(Vec::new());
         self.lua = None;
         let _ = self.outputs.send(Output::Cleared);

@@ -13,8 +13,10 @@ input { flex: 1; }
 <p id="status">connecting...</p>
 <div id="messages"></div>
 <form id="form">
+<select id="target" title="The agent that Send and Stop are for"><option>main</option></select>
 <input id="input" autocomplete="off" autofocus>
 <button>Send</button>
+<button type="button" id="stop">Stop</button>
 <button type="button" id="clear">Clear</button>
 </form>
 <script>
@@ -23,6 +25,8 @@ const list = document.getElementById("messages");
 const form = document.getElementById("form");
 const input = document.getElementById("input");
 const clear = document.getElementById("clear");
+const stop = document.getElementById("stop");
+const target = document.getElementById("target");
 
 // Each agent's context, by agent name, rebuilt from the JSON Patches Bip
 // streams. `main` is the primary agent; subagents are `sub-1`, `sub-2`, ...
@@ -44,7 +48,16 @@ function apply(state, op) {
   }
 }
 
+// Offer every running agent as a target, keeping the choice while it runs.
+function renderTargets() {
+  const names = ["main", ...Object.keys(agents).filter((a) => a !== "main")];
+  const chosen = names.includes(target.value) ? target.value : "main";
+  target.replaceChildren(...names.map((name) => new Option(name, name)));
+  target.value = chosen;
+}
+
 function render() {
+  renderTargets();
   list.innerHTML = "";
   for (const [agent, state] of Object.entries(agents)) {
     const heading = document.createElement("h3");
@@ -85,10 +98,11 @@ form.onsubmit = (event) => {
   event.preventDefault();
   const text = input.value.trim();
   if (!text) return;
-  send({ type: "message", data: { text } });
+  send({ type: "message", data: { text, agent: target.value } });
   input.value = "";
 };
 clear.onclick = () => send({ type: "clear" });
+stop.onclick = () => send({ type: "stop", data: { agent: target.value } });
 
 function connect() {
   socket = new WebSocket(`ws://${location.host}/ws`);

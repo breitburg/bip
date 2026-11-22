@@ -2,8 +2,9 @@ mod agent;
 mod context;
 mod interface;
 mod lua;
+mod swarm;
 
-use agent::{Agent, Input, Output};
+use agent::{Agent, Output};
 use async_openai::{Client, config::OpenAIConfig};
 use axum::{
     Router,
@@ -21,12 +22,14 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tower_http::services::ServeDir;
+use swarm::{Command, MAIN, Swarm};
 use tracing::{info, warn};
 
 /// What every connection handler needs.
 #[derive(Clone)]
 struct Server {
-    inputs: mpsc::Sender<Input>,
+    /// Where clients' commands go.
+    swarm: Swarm,
     /// Outputs as JSON text, serialized once for every client.
     outputs: broadcast::Sender<Utf8Bytes>,
     /// Every output sent so far, so a client that connects later can replay
@@ -48,22 +51,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_api_base(std::env::var("OPENAI_BASE_URL")?)
         .with_api_key(std::env::var("OPENAI_API_KEY")?);
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let swarm = Swarm::default();
     let (main, inputs) = Agent::new(
-        "main".into(),
+        MAIN.into(),
         Client::with_config(config),
         "claude-sonnet-5-5".into(),
         std::fs::read_to_string("system.md")?,
         output_tx,
         vec![interface::context::interface(), interface::agents::interface()],
         None,
+        swarm.clone(),
     );
-    let input_tx = main.inbox.clone();
-    tokio::spawn(main.run(inputs));
+    swarm.started(MAIN, tokio::spawn(main.run(inputs)));
 
     // Every connected client gets every output, so the agent's stream is
     // fanned out through a broadcast channel and recorded in the history.
     let server = Server {
-        inputs: input_tx,
+        swarm,
         outputs: broadcast::channel(256).0,
         history: Arc::default(),
     };
@@ -111,7 +115,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// One client: it sends `Input`s and receives every `Output` as JSON, starting
+/// One client: it sends `Command`s and receives every `Output` as JSON, starting
 /// with a replay of everything sent before it connected.
 async fn serve(socket: WebSocket, server: Server) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Subscribing while holding the lock means no output is missed or sent
@@ -127,17 +131,17 @@ async fn serve(socket: WebSocket, server: Server) -> Result<(), Box<dyn Error + 
     loop {
         tokio::select! {
             message = source.next() => match message {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str::<Input>(&text) {
-                    Ok(input) => server.inputs.send(input).await?,
+                Some(Ok(Message::Text(text))) => {
+                    let result = match serde_json::from_str::<Command>(&text) {
+                        Ok(command) => server.swarm.send(command).await,
+                        Err(e) => Err(format!("invalid input: {e}")),
+                    };
                     // Only this client sent it wrong, so only this client hears about it.
-                    Err(e) => {
-                        let error = Output::Error {
-                            agent: "main".into(),
-                            message: format!("invalid input: {e}"),
-                        };
+                    if let Err(message) = result {
+                        let error = Output::Error { agent: MAIN.into(), message };
                         sink.send(Message::text(serde_json::to_string(&error)?)).await?;
                     }
-                },
+                }
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
                 Some(Ok(_)) => {} // pings and binary frames are ignored
                 Some(Err(e)) => return Err(e.into()),

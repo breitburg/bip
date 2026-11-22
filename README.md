@@ -37,19 +37,30 @@ The two directions have separate message types.
 
 ### Client → Bip
 
+Clients control the whole swarm, not only `main`: `message` and `stop` name
+the agent they're for in `agent`, and go to `main` when they name none.
+
 | `type`    | `data` | Meaning                                    |
 |-----------|--------|--------------------------------------------|
-| `message` | `{"text"}` | A message for Bip from the person at this client. |
-| `clear`   | none   | Remove every message from Bip's context, and stop and clear every subagent. It takes effect at once, even in the middle of a reply. |
+| `message` | `{"text", "agent"?}` | A message for that agent from the person at this client. |
+| `stop`    | `{"agent"?}` or none | Stop what that agent is doing: its reply ends where it is, and every subagent it started is stopped, with no report. The context is kept, with what the agent had said so far. Messages that were waiting for the reply join the context unanswered; the agent answers them with the next message. A stopped subagent then finishes, and reports what it had said, marked `(stopped)`. |
+| `clear`   | none   | Remove every message from `main`'s context, and stop and remove every subagent. It takes effect at once, even in the middle of a reply. |
 
 ```json
 {"type": "message", "data": {"text": "Hey Bip!"}}
+{"type": "message", "data": {"text": "Focus on the tests", "agent": "sub-1"}}
+{"type": "stop"}
+{"type": "stop", "data": {"agent": "sub-2"}}
 {"type": "clear"}
 ```
 
-Bip handles messages one at a time, in the order they arrive, across all
-clients. A message that arrives while Bip is replying waits for the reply to
-end.
+A `stop` or a `clear` takes effect as soon as the agent is not inside a
+script, so at most 10 seconds later. A command for an agent that doesn't
+exist, or has finished, gets an `error` back, to the client that sent it only.
+
+Each agent handles messages one at a time, in the order they arrive, across
+all clients. A message that arrives while it's replying waits for the reply
+to end.
 
 ### Bip → client
 
@@ -78,6 +89,8 @@ has two:
   the background, with its own context, and when it finishes its final reply
   is added to the primary agent's context as a report. The primary agent then
   responds to it. A subagent can run Luau too, but has no interfaces.
+  `agents.stop(name)` stops one it started before it finishes; it then sends
+  no report.
 
 An interface is defined in Rust as a name, the documentation the model reads,
 and a function per entry, each given the runtime, the calling agent and the
@@ -90,9 +103,10 @@ Interface::new("agents", DOCS).function("spawn", |_, agent, task: String| { ... 
 Every output names the agent it belongs to: `main` for the primary agent, and
 `sub-1`, `sub-2`, ... for subagents, in the order they started. Clients get
 every agent's changes, so they can show what each one is doing. Each agent's
-context is separate and starts empty. Messages from clients go only to `main`.
-A subagent starts as soon as `agents.spawn` is called. When it finishes, or a `clear`
-stops it, Bip sends `finished` for it: it's gone, and so is its context.
+context is separate and starts empty. Clients can message and stop any agent
+by name. Names are unique until a `clear`, which starts numbering over.
+A subagent starts as soon as `agents.spawn` is called. When it finishes, or a `clear`,
+a `stop` or `agents.stop` stops it, Bip sends `finished` for it: it's gone, and so is its context.
 
 Bip doesn't send "replies". It streams changes to its context, the
 conversation it sees, as JSON Patches. The system prompt (`system.md`) isn't
