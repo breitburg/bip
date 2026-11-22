@@ -1,0 +1,109 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Bip</title>
+<style>
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+form { display: flex; gap: 8px; }
+input { flex: 1; }
+</style>
+</head>
+<body>
+<p id="status">connecting...</p>
+<div id="messages"></div>
+<form id="form">
+<input id="input" autofocus>
+<button>Send</button>
+<button type="button" id="clear">Clear</button>
+</form>
+<script>
+const status = document.getElementById("status");
+const list = document.getElementById("messages");
+const form = document.getElementById("form");
+const input = document.getElementById("input");
+const clear = document.getElementById("clear");
+
+// Bip's context, rebuilt from the JSON Patches it streams.
+let state;
+
+// Apply one JSON Patch (RFC 6902) operation. Bip only sends add, remove and
+// replace.
+function apply(op) {
+  const keys = op.path.split("/").slice(1).map((k) => k.replaceAll("~1", "/").replaceAll("~0", "~"));
+  const last = keys.pop();
+  let parent = state;
+  for (const key of keys) parent = parent[key];
+  if (op.op === "remove") {
+    Array.isArray(parent) ? parent.splice(Number(last), 1) : delete parent[last];
+  } else if (op.op === "add" && Array.isArray(parent)) {
+    parent.splice(last === "-" ? parent.length : Number(last), 0, op.value);
+  } else {
+    parent[last] = op.value;
+  }
+}
+
+function render() {
+  list.innerHTML = "";
+  for (const id of state.order) {
+    const m = state.messages[id];
+    let text = `[${m.id}] ${m.role.tool ? "tool" : m.role}\n${m.content}`;
+    for (const call of m.tool_calls) {
+      if (call.function) text += `\n-> ${call.function.name}(${call.function.arguments})`;
+    }
+    const pre = document.createElement("pre");
+    pre.textContent = text;
+    list.appendChild(pre);
+  }
+}
+
+// Patches arrive far faster than the screen redraws, so render at most once
+// per frame.
+let scheduled = false;
+function scheduleRender() {
+  if (scheduled) return;
+  scheduled = true;
+  requestAnimationFrame(() => {
+    scheduled = false;
+    render();
+  });
+}
+
+let socket;
+function send(input) {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(input));
+}
+form.onsubmit = (event) => {
+  event.preventDefault();
+  const text = input.value.trim();
+  if (!text) return;
+  send({ type: "message", data: text });
+  input.value = "";
+};
+clear.onclick = () => send({ type: "clear" });
+
+function connect() {
+  socket = new WebSocket(`ws://${location.host}/ws`);
+  socket.onopen = () => {
+    // Bip replays every change to each new connection, starting from this.
+    state = { messages: {}, order: [] };
+    status.textContent = "connected";
+  };
+  socket.onclose = () => {
+    status.textContent = "disconnected, retrying...";
+    setTimeout(connect, 1000);
+  };
+  socket.onmessage = (event) => {
+    const output = JSON.parse(event.data);
+    if (output.type === "change") {
+      output.data.forEach(apply);
+      scheduleRender();
+    } else if (output.type === "error") {
+      status.textContent = "error: " + output.data;
+    }
+  };
+}
+connect();
+</script>
+</body>
+</html>
