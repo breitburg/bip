@@ -1,6 +1,7 @@
 mod agent;
 mod context;
-mod tools;
+mod interface;
+mod lua;
 
 use agent::{Agent, Input, Output};
 use async_openai::{Client, config::OpenAIConfig};
@@ -19,7 +20,6 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
-use tools::{Tools, lua::Lua, revise::Revise, spawn::Spawn};
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
@@ -48,14 +48,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_api_base(std::env::var("OPENAI_BASE_URL")?)
         .with_api_key(std::env::var("OPENAI_API_KEY")?);
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
-    let tools: Tools = vec![Arc::new(Revise), Arc::new(Lua), Arc::new(Spawn)];
     let (main, inputs) = Agent::new(
         "main".into(),
         Client::with_config(config),
         "claude-sonnet-5-5".into(),
         std::fs::read_to_string("system.md")?,
         output_tx,
-        tools,
+        vec![interface::context::interface(), interface::agents::interface()],
         None,
     );
     let input_tx = main.inbox.clone();

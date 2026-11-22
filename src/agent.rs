@@ -1,5 +1,6 @@
 use crate::context::{Call, Context, METADATA, Role};
-use crate::tools::{self, Error, Tools};
+use crate::interface::{Error, Interface};
+use crate::lua;
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -63,9 +64,10 @@ pub struct Agent {
     pub system_prompt: String,
     /// Where everything this agent does goes, for clients to show.
     pub outputs: mpsc::UnboundedSender<Output>,
-    tools: Tools,
+    /// What this agent's scripts can reach outside their sandbox.
+    pub interfaces: Vec<Interface>,
     pub context: Context,
-    /// This agent's Luau runtime, started by its first `lua` call.
+    /// This agent's Luau runtime, started by its first script.
     pub lua: Option<mlua::Lua>,
     /// A way to this agent's own inputs, handed to subagents so they can
     /// report back.
@@ -93,7 +95,7 @@ impl Agent {
         model: String,
         system_prompt: String,
         outputs: mpsc::UnboundedSender<Output>,
-        tools: Tools,
+        interfaces: Vec<Interface>,
         parent: Option<mpsc::Sender<Input>>,
     ) -> (Self, mpsc::Receiver<Input>) {
         let (inbox, inputs) = mpsc::channel(8);
@@ -108,7 +110,7 @@ impl Agent {
             model,
             system_prompt,
             outputs,
-            tools,
+            interfaces,
             context,
             lua: None,
             inbox,
@@ -234,9 +236,10 @@ impl Agent {
         loop {
             while let Some(call) = self.context.pending_call().cloned() {
                 info!(tool = %call.name, arguments = %call.arguments, "tool call");
-                // A copy of the list, so the tool can borrow the whole agent.
-                let list = self.tools.clone();
-                let result = tools::call(&list, &call.name, &call.arguments, self).await;
+                let result = match call.name.as_str() {
+                    lua::NAME => lua::call(self, &call.arguments),
+                    name => format!("error: unknown tool: {name}"),
+                };
                 info!(tool = %call.name, %result, "tool result");
                 self.context.resolve(&call.id, result);
             }
@@ -264,11 +267,10 @@ impl Agent {
         let mut messages = vec![system.into()];
         messages.extend(self.context.request());
         let mut request = CreateChatCompletionRequestArgs::default();
-        request.model(self.model.as_str()).messages(messages);
-        // The API rejects an empty list, so an agent without tools sends none.
-        if !self.tools.is_empty() {
-            request.tools(self.tools.iter().map(|tool| tool.definition()).collect::<Vec<_>>());
-        }
+        request
+            .model(self.model.as_str())
+            .messages(messages)
+            .tools(vec![lua::definition(&self.interfaces)]);
         let request = request.build()?;
         debug!(messages = %serde_json::to_string(&request.messages)?, "request");
         let mut stream = self.client.chat().create_stream(request).await?;

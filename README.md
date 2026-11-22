@@ -62,23 +62,36 @@ end.
 
 #### Agents
 
-Bip can start subagents with its `spawn` tool. A subagent works on its task in
-the background, with its own context, and when it finishes its final reply
-is added to the primary agent's context as a report. The primary agent then
-responds to it.
+Bip has exactly one tool, `lua`, which runs Luau code. Each agent has its
+own runtime, and globals persist between calls until a `clear`. The runtime
+is sandboxed: only the `string`, `table`, `math`, `utf8`, `bit32` and
+`buffer` libraries, no files, processes or network, 10 seconds per call and
+64 MB in all.
 
-Bip can also run Luau code with its `lua` tool. Each agent has its own
-runtime, and globals persist between calls until a `clear`. The runtime is
-sandboxed: only the `string`, `table`, `math`, `utf8`, `bit32` and `buffer`
-libraries, no files, processes or network, 10 seconds per call and 64 MB in
-all. Scripts can read the agent's own conversation through the `context`
-global.
+Everything else Bip can do, it does from a script, through interfaces:
+global tables of functions that reach outside the sandbox. The primary agent
+has two:
+
+- `context`: read its own conversation (`context.messages()`), and edit and
+  rewind it (`context.revise{...}`).
+- `agents`: `agents.spawn(task)` starts a subagent. It works on its task in
+  the background, with its own context, and when it finishes its final reply
+  is added to the primary agent's context as a report. The primary agent then
+  responds to it. A subagent can run Luau too, but has no interfaces.
+
+An interface is defined in Rust as a name, the documentation the model reads,
+and a function per entry, each given the runtime, the calling agent and the
+script's arguments (see `src/interface.rs`):
+
+```rust
+Interface::new("agents", DOCS).function("spawn", |_, agent, task: String| { ... })
+```
 
 Every output names the agent it belongs to: `main` for the primary agent, and
 `sub-1`, `sub-2`, ... for subagents, in the order they started. Clients get
 every agent's changes, so they can show what each one is doing. Each agent's
 context is separate and starts empty. Messages from clients go only to `main`.
-A subagent starts as soon as `spawn` is called. When it finishes, or a `clear`
+A subagent starts as soon as `agents.spawn` is called. When it finishes, or a `clear`
 stops it, Bip sends `finished` for it: it's gone, and so is its context.
 
 Bip doesn't send "replies". It streams changes to its context, the
@@ -118,7 +131,7 @@ falls far behind (256 outputs) misses the ones it couldn't keep up with.
   "content": "Hey Ilia! What's up?",
   "time": "2026-11-22T01:47:53.964114Z",
   "tool_calls": [
-    {"id": "call_1", "name": "spawn", "arguments": "{\"task\": \"...\"}", "result": "Started subagent sub-1."}
+    {"id": "call_1", "name": "lua", "arguments": "{\"code\": \"agents.spawn(...)\"}", "result": "sub-1"}
   ]
 }
 ```
@@ -128,8 +141,8 @@ falls far behind (256 outputs) misses the ones it couldn't keep up with.
 - `role`: `"user"`, `"assistant"`, or `{"agent": "sub-1"}` for a message from
   another agent: a subagent's report, or the task a subagent was given.
 - `time`: when the message joined the context.
-- `tool_calls`: tools the assistant called in this message. `arguments` is
-  the JSON text the model wrote. `result` is `null` while the tool runs, then
+- `tool_calls`: tools the assistant called in this message; the only tool is
+  `lua`. `arguments` is the JSON text the model wrote. `result` is `null` while the tool runs, then
   the text it returned. A result is part of its call, not a message of its
   own.
 

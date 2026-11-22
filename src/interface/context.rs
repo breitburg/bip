@@ -1,36 +1,112 @@
-use crate::context::{Context, Message, Role, frozen_from};
-use crate::agent::Agent;
-use crate::tools::{Error, Tool};
-use schemars::JsonSchema;
+use crate::context::{Context, Message, Role, TIME_FORMAT, frozen_from};
+use crate::interface::{Error, Interface};
+use mlua::{Lua, LuaSerdeExt, Table, Value};
 use serde::Deserialize;
 
-/// Revise the conversation: remove or rewrite earlier messages with `edits`, then continue
-/// the conversation from right after `resume_from`. Everything after that
-/// message is dropped, including the request that led to this call and this
-/// call itself, so the conversation reads as if it had always been this way.
-///
-/// If `resume_from` is a message to you, from the person or another agent,
-/// you reply to it afresh. If it's one of
-/// your own messages, the turn ends there, unless that message called tools:
-/// then its results stay and you go on after them. When the person asks you to change
-/// the conversation, apply the change and resume from the message just before
-/// their request.
-///
-/// Every message except tool results starts with a `<metadata>` tag holding
-/// its 6-character ID and when it arrived; refer to messages by that ID.
-/// Removing a message that called tools also removes the tools' results. The
-/// current turn can't be edited. Edits apply in order, and if any fails,
-/// nothing changes.
-#[derive(Deserialize, JsonSchema)]
+const DOCS: &str = "\
+`context` is your own conversation, as it is right now, including this
+call's message. Every message except tool results starts with a `<metadata>`
+tag holding its 6-character ID and when it arrived; refer to messages by
+that ID.
+
+- `context.count()`: how many messages there are.
+- `context.message(i)`: the message at 1-based index `i`, as a table with
+  `id`, `role` (`\"user\"`, `\"assistant\"` or `\"agent\"`), `from` (the
+  agent's name, for `\"agent\"`), `content`, `time`, and `calls`, a list of
+  tools it called with their `name`, `arguments` and `result`.
+- `context.messages()`: all of them, as a list.
+- `context.find(id)`: the index of the message with that ID, or nil.
+- `context.revise{edits = {...}, resume_from = id}`: remove or rewrite
+  earlier messages, then continue the conversation from right after the
+  message `resume_from`. Everything after that message is dropped, including
+  the request that led to this call and this call itself, so the
+  conversation reads as if it had always been this way. Nothing the script
+  does after `revise` is kept, so call it last.
+
+  `edits` is a list, applied in order, and may be empty, to only rewind. Each
+  edit is `{action = \"remove\", id = id}`, which deletes a message, or
+  `{action = \"rewrite\", id = id, blocks = text}`, which changes a
+  message's text with one or more search/replace blocks:
+
+  <<<<<<< SEARCH
+  exact text to find
+  =======
+  text to put in its place
+  >>>>>>> REPLACE
+
+  Each SEARCH text must appear exactly once in the message, as it is after
+  the blocks before it. An empty REPLACE deletes the text. If any edit
+  fails, nothing changes.
+
+  If `resume_from` is a message to you, from the person or another agent,
+  you reply to it afresh; it can't be the latest such message unless `edits`
+  rewrites it. If it's one of your own messages, the turn ends there, unless
+  that message called tools: then its results stay and you go on after them.
+  When the person asks you to change the conversation, apply the change and
+  resume from the message just before their request. Removing a message that
+  called tools also removes the tools' results. The current turn can't be
+  edited.";
+
+/// Lets an agent read its own conversation, and edit and rewind it.
+pub fn interface() -> Interface {
+    Interface::new("context", DOCS)
+        .function("count", |_, agent, ()| Ok(agent.context.messages().len()))
+        .function("message", |lua, agent, index: usize| {
+            let message = index.checked_sub(1).and_then(|i| agent.context.messages().get(i));
+            Ok(message.map(|m| table(lua, m)).transpose()?)
+        })
+        .function("messages", |lua, agent, ()| {
+            let messages = agent.context.messages().iter().map(|m| table(lua, m));
+            Ok(lua.create_sequence_from(messages.collect::<mlua::Result<Vec<_>>>()?)?)
+        })
+        .function("find", |_, agent, id: String| {
+            let mut messages = agent.context.messages().iter();
+            Ok(messages.position(|m| m.id.eq_ignore_ascii_case(&id)).map(|i| i + 1))
+        })
+        .function("revise", |lua, agent, args: Value| {
+            revise(lua.from_value(args)?, &mut agent.context)
+        })
+}
+
+/// A message as a script sees it.
+fn table(lua: &Lua, message: &Message) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("id", message.id.as_str())?;
+    let (role, from) = match &message.role {
+        Role::User => ("user", None),
+        Role::Assistant => ("assistant", None),
+        Role::Agent(name) => ("agent", Some(name.as_str())),
+    };
+    table.set("role", role)?;
+    table.set("from", from)?;
+    table.set("content", message.content.as_str())?;
+    table.set("time", message.time.format(TIME_FORMAT).to_string())?;
+    let calls = message.tool_calls.iter().map(|call| {
+        let entry = lua.create_table()?;
+        entry.set("name", call.name.as_str())?;
+        entry.set("arguments", call.arguments.as_str())?;
+        entry.set("result", call.result.as_deref())?;
+        Ok(entry)
+    });
+    table.set(
+        "calls",
+        lua.create_sequence_from(calls.collect::<mlua::Result<Vec<_>>>()?)?,
+    )?;
+    Ok(table)
+}
+
+/// What `context.revise` takes.
+#[derive(Deserialize)]
 pub struct Args {
     /// Changes to make, in order. May be empty, to only rewind.
+    #[serde(default)]
     edits: Vec<Operation>,
     /// The ID of an existing message to continue from, after the edits. It
     /// can't be the person's latest message unless `edits` rewrites it.
     resume_from: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Operation {
     /// Delete a message.
@@ -46,18 +122,6 @@ enum Operation {
     /// Each SEARCH text must appear exactly once in the message, as it is
     /// after the blocks before it. An empty REPLACE deletes the text.
     Rewrite { id: String, blocks: String },
-}
-
-/// Lets an agent edit and rewind its own conversation.
-pub struct Revise;
-
-impl Tool for Revise {
-    const NAME: &'static str = "revise";
-    type Args = Args;
-
-    async fn call(&self, args: Args, agent: &mut Agent) -> Result<String, Error> {
-        revise(args, &mut agent.context)
-    }
 }
 
 fn revise(args: Args, context: &mut Context) -> Result<String, Error> {
