@@ -1,8 +1,15 @@
 # Bip
 
-Bip is an AI agent in development. It runs as a WebSocket server; any client
-that speaks the protocol below can talk to it. `static/index.html` is a minimal
-one, served by Bip itself.
+Bip is a foundation for asynchronous AI agents.
+
+Each agent has one tool, a sandboxed Luau runtime. Scripts call interfaces to
+reach external systems, spawn subagents and edit the agent's own context.
+Adding a capability means adding an interface.
+
+Agents run in the background and accept messages while they work. Every
+change to an agent's context is streamed to clients as it happens. The
+protocol works over any transport, and WebSocket is the one implemented so
+far. `static/index.html` is a playground for testing.
 
 ## Running
 
