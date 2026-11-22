@@ -7,7 +7,7 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 
 /// How long one run may take before it's stopped.
-const TIME_LIMIT: Duration = Duration::from_secs(10);
+const TIME_LIMIT: Duration = Duration::from_secs(30 * 60);
 /// How much memory a session's scripts may hold, all runs together.
 const MEMORY_LIMIT: usize = 64 << 20;
 /// How much of a run's output goes back, so a runaway `print` can't flood
@@ -24,7 +24,7 @@ like a REPL: `1 + 1` gives `2`. `print` output comes back too.
 
 The runtime is sandboxed: it has the `string`, `table`, `math`, `utf8`,
 `bit32` and `buffer` libraries, and nothing that reaches files, processes or
-the network. Each call may run for 10 seconds.";
+the network. Each call may run for 30 minutes.";
 
 /// What the model fills in.
 #[derive(Deserialize)]
@@ -90,8 +90,8 @@ fn start(interfaces: &[Interface]) -> Result<mlua::Lua, Error> {
     lua.set_memory_limit(MEMORY_LIMIT)?;
     lua.set_interrupt(|lua| match lua.app_data_ref::<Deadline>() {
         Some(deadline) if Instant::now() > deadline.0 => Err(mlua::Error::runtime(format!(
-            "stopped after {} seconds",
-            TIME_LIMIT.as_secs()
+            "stopped after {} minutes",
+            TIME_LIMIT.as_secs() / 60
         ))),
         _ => Ok(VmState::Continue),
     });

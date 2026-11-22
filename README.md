@@ -34,7 +34,7 @@ sent with every request but isn't part of the context.
 The only tool is `lua`. Each agent gets its own Luau runtime, and globals
 persist between calls until a reset. The sandbox has the `string`, `table`,
 `math`, `utf8`, `bit32` and `buffer` libraries and nothing else. There's no
-file, process or network access. A call may run for 10 seconds, and an
+file, process or network access. A call may run for 30 minutes, and an
 agent's runtime may use 64 MB.
 
 Interfaces are global tables of Rust functions that scripts can call. `main`
@@ -49,13 +49,87 @@ has two of them.
 
 Subagents can run Luau but have no interfaces.
 
+### Scripts
+
+These are scripts an agent might send to `lua`. A script that is a single
+expression returns its value, and `print` output comes back too.
+
+Globals persist between calls, so an agent can keep state around.
+
+```lua
+notes = notes or {}
+table.insert(notes, "Prefers short answers")
+return #notes
+```
+
+Work can be split across subagents. `spawn` returns at once, and each report
+arrives later as a message from that subagent.
+
+```lua
+local names = {}
+for _, language in {"French", "German", "Japanese"} do
+  table.insert(names, agents.spawn("Translate into " .. language .. ": The meeting moved to Friday."))
+end
+return names
+```
+
+An agent can read its own conversation.
+
+```lua
+local asked = 0
+for _, m in context.messages() do
+  if m.role == "user" then asked += 1 end
+end
+return asked
+```
+
+It can also rewrite it. This removes one message, fixes a word in another,
+and continues from right after a third, as if everything after it never
+happened.
+
+```lua
+context.revise{
+  edits = {
+    {action = "remove", id = "8468AF"},
+    {action = "rewrite", id = "0E9258", blocks = [[
+<<<<<<< SEARCH
+Paris
+=======
+Lyon
+>>>>>>> REPLACE
+]]},
+  },
+  resume_from = "1B2C3D",
+}
+```
+
+### Adding an interface
+
 An interface is a name, docs for the model, and a function per entry. Each
-function gets the runtime, the calling agent and the script's arguments. See
-`src/interface.rs`.
+function gets the runtime, the calling agent and the script's arguments. The
+docs are added to the `lua` tool's description, which is how the model learns
+the interface exists. See `src/interface.rs`.
+
+This one lets scripts read the time.
 
 ```rust
-Interface::new("agents", DOCS).function("spawn", |_, agent, task: String| { ... })
+// src/interface/clock.rs
+use crate::interface::Interface;
+
+const DOCS: &str = "\
+`clock` tells the time.
+
+- `clock.now()`: the current UTC time, like `2026-11-22T19:32:10Z`.";
+
+pub fn interface() -> Interface {
+    Interface::new("clock", DOCS)
+        .function("now", |_, _, ()| Ok(chrono::Utc::now().format("%FT%TZ").to_string()))
+}
 ```
+
+Declare it with `pub mod clock;` in `src/interface.rs` and add
+`interface::clock::interface()` to `main`'s list in `src/main.rs`. Scripts can
+then call `clock.now()`.
 
 ## Protocol
 
@@ -87,7 +161,7 @@ a text frame. The same server serves `static/` over HTTP.
 ```
 
 `stop` and `reset` interrupt a reply, but wait for a running script to end,
-which takes at most 10 seconds. A command for an agent that doesn't exist
+which takes at most 30 minutes. A command for an agent that doesn't exist
 gets an `error` back, sent only to that client.
 
 Each agent handles messages one at a time, in arrival order, across all
