@@ -10,6 +10,8 @@ use axum::{
         State, WebSocketUpgrade,
         ws::{Message, Utf8Bytes, WebSocket},
     },
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
     routing::get,
 };
 use futures::{SinkExt, StreamExt};
@@ -17,6 +19,7 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
+use tools::{Tools, lua::Lua, revise::Revise, spawn::Spawn};
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
@@ -44,14 +47,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = OpenAIConfig::new()
         .with_api_base(std::env::var("OPENAI_BASE_URL")?)
         .with_api_key(std::env::var("OPENAI_API_KEY")?);
-    let agent = Agent::new(
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    // Subagents may revise their own context but not start subagents.
+    let subagent_tools = Tools::default().with(Revise).with(Lua);
+    let tools = Tools::default().with(Revise).with(Lua).with(Spawn {
+        tools: subagent_tools,
+    });
+    let (main, inputs) = Agent::new(
+        "main".into(),
         Client::with_config(config),
+        "claude-sonnet-5-5".into(),
         std::fs::read_to_string("system.md")?,
+        output_tx,
+        tools,
+        None,
     );
-
-    let (input_tx, input_rx) = mpsc::channel(8);
-    let (output_tx, mut output_rx) = mpsc::channel(64);
-    tokio::spawn(agent.run("claude-sonnet-5-5", vec![], input_rx, output_tx));
+    let input_tx = main.inbox.clone();
+    tokio::spawn(main.run(inputs));
 
     // Every connected client gets every output, so the agent's stream is
     // fanned out through a broadcast channel and recorded in the history.
@@ -73,7 +85,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route(
             "/ws",
             get(
-                |ws: WebSocketUpgrade, State(server): State<Server>| async move {
+                |ws: WebSocketUpgrade, headers: HeaderMap, State(server): State<Server>| async move {
+                    // Browsers send the page's origin with a WebSocket request.
+                    // Only the page Bip serves may connect, so another site open
+                    // in the browser can't read or drive the conversation.
+                    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+                    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+                    if origin.is_some_and(|origin| Some(origin) != host.map(|h| format!("http://{h}")).as_deref()) {
+                        warn!(?origin, "refused a connection from another site");
+                        return StatusCode::FORBIDDEN.into_response();
+                    }
                     ws.on_upgrade(|socket| async move {
                         info!("client connected");
                         if let Err(e) = serve(socket, server).await {
@@ -115,7 +136,10 @@ async fn serve(socket: WebSocket, server: Server) -> Result<(), Box<dyn Error + 
                     Ok(input) => server.inputs.send(input).await?,
                     // Only this client sent it wrong, so only this client hears about it.
                     Err(e) => {
-                        let error = Output::Error(format!("invalid input: {e}"));
+                        let error = Output::Error {
+                            agent: "main".into(),
+                            message: format!("invalid input: {e}"),
+                        };
                         sink.send(Message::text(serde_json::to_string(&error)?)).await?;
                     }
                 },

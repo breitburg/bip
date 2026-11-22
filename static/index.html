@@ -13,7 +13,7 @@ input { flex: 1; }
 <p id="status">connecting...</p>
 <div id="messages"></div>
 <form id="form">
-<input id="input" autofocus>
+<input id="input" autocomplete="off" autofocus>
 <button>Send</button>
 <button type="button" id="clear">Clear</button>
 </form>
@@ -24,12 +24,13 @@ const form = document.getElementById("form");
 const input = document.getElementById("input");
 const clear = document.getElementById("clear");
 
-// Bip's context, rebuilt from the JSON Patches it streams.
-let state;
+// Each agent's context, by agent name, rebuilt from the JSON Patches Bip
+// streams. `main` is the primary agent; subagents are `sub-1`, `sub-2`, ...
+let agents;
 
-// Apply one JSON Patch (RFC 6902) operation. Bip only sends add, remove and
-// replace.
-function apply(op) {
+// Apply one JSON Patch (RFC 6902) operation to `state`. Bip only sends add,
+// remove and replace.
+function apply(state, op) {
   const keys = op.path.split("/").slice(1).map((k) => k.replaceAll("~1", "/").replaceAll("~0", "~"));
   const last = keys.pop();
   let parent = state;
@@ -45,15 +46,22 @@ function apply(op) {
 
 function render() {
   list.innerHTML = "";
-  for (const id of state.order) {
-    const m = state.messages[id];
-    let text = `[${m.id}] ${m.role.tool ? "tool" : m.role}\n${m.content}`;
-    for (const call of m.tool_calls) {
-      if (call.function) text += `\n-> ${call.function.name}(${call.function.arguments})`;
+  for (const [agent, state] of Object.entries(agents)) {
+    const heading = document.createElement("h3");
+    heading.textContent = agent;
+    list.appendChild(heading);
+    for (const id of state.order) {
+      const m = state.messages[id];
+      const role = m.role.agent ? `from ${m.role.agent}` : m.role;
+      let text = `[${m.id}] ${role}\n${m.content}`;
+      for (const call of m.tool_calls) {
+        text += `\n-> ${call.name}(${call.arguments})`;
+        if (call.result !== null) text += `\n<- ${call.result}`;
+      }
+      const pre = document.createElement("pre");
+      pre.textContent = text;
+      list.appendChild(pre);
     }
-    const pre = document.createElement("pre");
-    pre.textContent = text;
-    list.appendChild(pre);
   }
 }
 
@@ -77,7 +85,7 @@ form.onsubmit = (event) => {
   event.preventDefault();
   const text = input.value.trim();
   if (!text) return;
-  send({ type: "message", data: text });
+  send({ type: "message", data: { text } });
   input.value = "";
 };
 clear.onclick = () => send({ type: "clear" });
@@ -85,8 +93,8 @@ clear.onclick = () => send({ type: "clear" });
 function connect() {
   socket = new WebSocket(`ws://${location.host}/ws`);
   socket.onopen = () => {
-    // Bip replays every change to each new connection, starting from this.
-    state = { messages: {}, order: [] };
+    // Bip replays every change to each new connection, so start empty.
+    agents = {};
     status.textContent = "connected";
   };
   socket.onclose = () => {
@@ -96,10 +104,18 @@ function connect() {
   socket.onmessage = (event) => {
     const output = JSON.parse(event.data);
     if (output.type === "change") {
-      output.data.forEach(apply);
+      const { agent, patch } = output.data;
+      agents[agent] ??= { messages: {}, order: [] };
+      for (const op of patch) apply(agents[agent], op);
+      scheduleRender();
+    } else if (output.type === "finished") {
+      delete agents[output.data.agent];
+      scheduleRender();
+    } else if (output.type === "cleared") {
+      agents = {};
       scheduleRender();
     } else if (output.type === "error") {
-      status.textContent = "error: " + output.data;
+      status.textContent = `error in ${output.data.agent}: ${output.data.message}`;
     }
   };
 }

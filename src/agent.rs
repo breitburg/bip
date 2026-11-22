@@ -1,29 +1,36 @@
-use crate::context::{Context, METADATA, Role};
-use crate::tools::{self, Tool};
+use crate::context::{Call, Context, METADATA, Role};
+use crate::tools::{Error, Tools};
 use async_openai::{
     Client,
     config::OpenAIConfig,
-    types::chat::{
-        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-        ChatCompletionRequestSystemMessage, ChatCompletionTools, CreateChatCompletionRequestArgs,
-    },
+    types::chat::{ChatCompletionRequestSystemMessage, CreateChatCompletionRequestArgs},
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt, future::BoxFuture};
 use json_patch::Patch;
-use std::error::Error;
-use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info, warn};
+use std::collections::VecDeque;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{Instrument, debug, info, info_span, warn};
+
+/// How many times one turn may call the model before it's given up on.
+const MAX_STEPS: usize = 5;
 
 /// What the agent sends out. The stream never ends while the agent runs:
 /// it may say things on its own, not only in reply to an input.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Output {
-    /// A change to the context, as a JSON Patch. Applying them in order to
-    /// `{"messages": {}, "order": []}` rebuilds the conversation.
-    Change(Patch),
-    /// Something went wrong with this input. The agent keeps running.
-    Error(String),
+    /// A change to one agent's context, as a JSON Patch. Applying an agent's
+    /// patches in order to `{"messages": {}, "order": []}` rebuilds its
+    /// conversation. The primary agent is `main`; subagents are `sub-1`, ...
+    Change { agent: String, patch: Patch },
+    /// Something went wrong in one agent's turn. The agent keeps running.
+    Error { agent: String, message: String },
+    /// This agent is gone, done or stopped. Nothing more will come from it.
+    Finished { agent: String },
+    /// A `clear` is complete: `main` is empty and every subagent is gone, so
+    /// their conversations can be forgotten.
+    Cleared,
 }
 
 /// What the agent accepts. Clients send these as JSON; the protocol is
@@ -31,217 +38,279 @@ pub enum Output {
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Input {
-    /// A message for Bip from a person.
-    Message(String),
-    /// Remove every message from the context.
+    /// A message for this agent: from a person, or from the agent named in
+    /// `from`, like a subagent reporting back.
+    Message {
+        text: String,
+        /// Set only by agents; clients can't claim to be one.
+        #[serde(skip_deserializing)]
+        from: Option<String>,
+    },
+    /// Remove every message from the context, and stop and clear every
+    /// subagent. Unlike a message, this doesn't wait for the turn to end.
     Clear,
 }
 
-/// The agent before it runs: a model client and its system prompt.
+/// One agent, primary or subagent: its name, how it reaches the model, the
+/// conversation it sees, and what it can do.
 pub struct Agent {
-    client: Client<OpenAIConfig>,
+    /// `main`, or `sub-N` for a subagent. Outputs and logs carry it.
+    pub name: String,
+    pub client: Client<OpenAIConfig>,
+    pub model: String,
     /// Sent ahead of the context on every request. It isn't part of the
     /// context, so it has no ID, can't be edited, and isn't published.
-    system_prompt: String,
+    pub system_prompt: String,
+    /// Where everything this agent does goes, for clients to show.
+    pub outputs: mpsc::UnboundedSender<Output>,
+    tools: Tools,
+    pub context: Context,
+    /// This agent's Luau runtime, started by its first `lua` call.
+    pub lua: Option<mlua::Lua>,
+    /// A way to this agent's own inputs, handed to subagents so they can
+    /// report back.
+    pub inbox: mpsc::Sender<Input>,
+    /// Who started this agent, to report to when it's done. None for `main`.
+    parent: Option<mpsc::Sender<Input>>,
+    /// The subagents this agent started, each running on its own.
+    pub children: Vec<JoinHandle<()>>,
 }
 
-/// A running agent: everything `run` was given, for the turn loop.
-struct Session {
-    client: Client<OpenAIConfig>,
-    system_prompt: String,
-    model: String,
-    /// The caller's tools followed by the internal ones, like `revise`.
-    tools: Vec<Tool>,
-    context: Context,
+/// However an agent goes, by finishing or by being stopped, it says so as
+/// the last thing it does.
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let agent = self.name.clone();
+        let _ = self.outputs.send(Output::Finished { agent });
+    }
 }
 
 impl Agent {
-    pub fn new(client: Client<OpenAIConfig>, system_prompt: String) -> Self {
-        Self {
+    /// A new agent, and the inputs to `run` it on.
+    pub fn new(
+        name: String,
+        client: Client<OpenAIConfig>,
+        model: String,
+        system_prompt: String,
+        outputs: mpsc::UnboundedSender<Output>,
+        tools: Tools,
+        parent: Option<mpsc::Sender<Input>>,
+    ) -> (Self, mpsc::Receiver<Input>) {
+        let (inbox, inputs) = mpsc::channel(8);
+        let (agent, publish) = (name.clone(), outputs.clone());
+        let context = Context::new(move |patch| {
+            let agent = agent.clone();
+            let _ = publish.send(Output::Change { agent, patch });
+        });
+        let agent = Self {
+            name,
             client,
+            model,
             system_prompt,
-        }
+            outputs,
+            tools,
+            context,
+            lua: None,
+            inbox,
+            parent,
+            children: Vec::new(),
+        };
+        (agent, inputs)
     }
 
-    /// Handle every input from `inputs` in order with `model` and `tools`
-    /// (plus the internal tools). Every change to the context goes to
-    /// `outputs` as it happens. Returns when `inputs` closes.
-    pub async fn run(
-        self,
-        model: impl Into<String>,
-        mut tools: Vec<Tool>,
-        mut inputs: mpsc::Receiver<Input>,
-        outputs: mpsc::Sender<Output>,
-    ) {
-        tools.push(tools::tool("revise", tools::revise::revise));
-        let mut session = Session {
-            client: self.client,
-            system_prompt: self.system_prompt,
-            model: model.into(),
-            tools,
-            context: Context::new(),
-        };
-        let mut changes = session.context.subscribe();
-
-        // The context publishes its own changes; the agent only passes them
-        // on.
-        let forward = outputs.clone();
-        tokio::spawn(async move {
+    /// Handle inputs in order, forever for `main`. A subagent stops once it
+    /// has nothing left to do and none of its own subagents is running, and
+    /// sends its last reply to its parent as a message.
+    ///
+    /// Boxed, because a subagent's `run` is started from inside its parent's
+    /// `run`, and only a boxed future can contain itself.
+    pub fn run(mut self, mut inputs: mpsc::Receiver<Input>) -> BoxFuture<'static, ()> {
+        let span = info_span!("agent", name = %self.name);
+        async move {
+            // Messages that arrived during a turn, waiting for it to end.
+            let mut queued = VecDeque::new();
+            let mut failure = None;
             loop {
-                match changes.recv().await {
-                    Ok(patch) => {
-                        if forward.send(Output::Change(patch)).await.is_err() {
-                            break;
+                let idle = queued.is_empty() && inputs.is_empty();
+                // A finished subagent's report is already in `inputs`.
+                if idle && self.parent.is_some() && self.children.iter().all(|c| c.is_finished()) {
+                    break;
+                }
+                let input = match queued.pop_front() {
+                    Some(input) => input,
+                    None => match inputs.recv().await {
+                        Some(input) => input,
+                        None => break,
+                    },
+                };
+                match input {
+                    Input::Message { text, from } => {
+                        self.context.push(from.map_or(Role::User, Role::Agent), text);
+                    }
+                    Input::Clear => {
+                        self.clear().await;
+                        continue;
+                    }
+                }
+
+                // A clear stops the turn where it is; dropping `turn` does that.
+                let result = {
+                    let turn = self.respond();
+                    tokio::pin!(turn);
+                    loop {
+                        tokio::select! {
+                            result = &mut turn => break Some(result),
+                            input = inputs.recv() => match input {
+                                Some(Input::Clear) => break None,
+                                Some(message) => queued.push_back(message),
+                                None => {} // only `main` can lose its senders
+                            },
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(n, "context changes dropped");
+                };
+                failure = match result {
+                    Some(Ok(())) => None,
+                    Some(Err(e)) => {
+                        let message = e.to_string();
+                        warn!(%message, "turn failed");
+                        let agent = self.name.clone();
+                        let _ = self.outputs.send(Output::Error {
+                            agent,
+                            message: message.clone(),
+                        });
+                        Some(message)
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
+                    None => {
+                        // Messages from before the clear are cleared with it.
+                        queued.clear();
+                        self.clear().await;
+                        None
+                    }
+                };
             }
-        });
-
-        while let Some(input) = inputs.recv().await {
-            let message = match input {
-                Input::Message(message) => message,
-                Input::Clear => {
-                    info!("clearing context");
-                    session.context.update(|messages| messages.clear());
-                    continue;
-                }
-            };
-            session.context.push(Role::User, message);
-            // The error becomes a String before the next await, since
-            // `Box<dyn Error>` can't be held across one in a spawned task.
-            let error = session.respond().await.err().map(|e| e.to_string());
-            if let Some(error) = error {
-                warn!(%error, "turn failed");
-                let _ = outputs.send(Output::Error(error)).await;
+            if let Some(parent) = self.parent.take() {
+                let text = match failure {
+                    Some(message) => format!("(failed: {message})"),
+                    None => self.last_reply(),
+                };
+                let from = Some(self.name.clone());
+                let _ = parent.send(Input::Message { text, from }).await;
             }
         }
+        .instrument(span)
+        .boxed()
     }
-}
 
-impl Session {
-    /// Call the model until it answers without calling tools.
-    async fn respond(&mut self) -> Result<(), Box<dyn Error>> {
-        for step in 1..=5 {
+    fn last_reply(&self) -> String {
+        let replies = self.context.messages().iter().rev();
+        replies
+            .filter(|m| m.role == Role::Assistant && !m.content.is_empty())
+            .map(|m| m.content.clone())
+            .next()
+            .unwrap_or_else(|| "(finished without replying)".into())
+    }
+
+    async fn clear(&mut self) {
+        info!("clearing context");
+        // Wait until the subagents are really gone, so `Cleared` comes after
+        // everything they sent.
+        for child in self.children.drain(..) {
+            child.abort();
+            let _ = child.await;
+        }
+        self.context.replace(Vec::new());
+        self.lua = None;
+        let _ = self.outputs.send(Output::Cleared);
+    }
+
+    /// Take the turn: run the tools the model called and call the model
+    /// again, until the conversation ends on a reply that calls none.
+    ///
+    /// The context alone says what to do next, so a tool that rewrites it
+    /// needs no special handling here. A call that's gone from the context is
+    /// never run, and its result has nowhere to go.
+    async fn respond(&mut self) -> Result<(), Error> {
+        let mut steps = 0;
+        loop {
+            while let Some(call) = self.context.pending_call().cloned() {
+                info!(tool = %call.name, arguments = %call.arguments, "tool call");
+                // Tools are shared handles, so a copy lets the tool borrow the
+                // whole agent.
+                let tools = self.tools.clone();
+                let result = tools.call(&call.name, &call.arguments, self).await;
+                info!(tool = %call.name, %result, "tool result");
+                self.context.resolve(&call.id, result);
+            }
+            if !self.context.awaits_reply() {
+                info!(steps, "done");
+                return Ok(());
+            }
+            if steps == MAX_STEPS {
+                return Err(format!("model did not finish within {MAX_STEPS} steps").into());
+            }
+            steps += 1;
             info!(
-                step,
+                step = steps,
                 messages = self.context.messages().len(),
                 "sending request"
             );
-            let tool_calls = self.stream_reply().await?;
-            if tool_calls.is_empty() {
-                info!(steps = step, "done");
-                return Ok(());
-            }
-
-            // The reply that made these calls, and everything after it, is
-            // the current turn, which `revise` can't touch. Results are added
-            // once all the tools ran, so every call keeps its result.
-            self.context.current = self.context.messages().last().map(|m| m.id.clone());
-            let mut results = Vec::new();
-            let mut resume_from = None;
-            for call in &tool_calls {
-                let ChatCompletionMessageToolCalls::Function(call) = call else {
-                    continue;
-                };
-                let (name, arguments) = (&call.function.name, &call.function.arguments);
-                info!(tool = %name, %arguments, "tool call");
-                let output = match self
-                    .tools
-                    .iter()
-                    .find(|(tool, _)| tool.function.name == *name)
-                {
-                    Some((_, run)) => run(arguments, &mut self.context),
-                    None => Err(format!("unknown tool: {name}").into()),
-                };
-                let output = output.unwrap_or_else(|e| {
-                    warn!(tool = %name, error = %e, "tool failed");
-                    format!("error: {e}").into()
-                });
-                info!(tool = %name, output = %output.text, "tool result");
-                resume_from = output.resume_from.or(resume_from);
-                results.push((call.id.clone(), output.text));
-            }
-            self.context.current = None;
-
-            // A tool asked to continue from an earlier message: drop
-            // everything after it, this turn included, then go on from there.
-            // The whole tail goes at once, so every call leaves with its result.
-            if let Some(id) = resume_from {
-                let Some(index) = self.context.messages().iter().position(|m| m.id == id) else {
-                    return Err(format!("can't resume from {id}: it no longer exists").into());
-                };
-                info!(%id, "resuming");
-                self.context.update(|messages| messages.truncate(index + 1));
-                // Resuming from one of Bip's own messages means it has said
-                // what it wanted to; there's nothing to reply to.
-                if matches!(self.context.messages()[index].role, Role::Assistant) {
-                    info!(steps = step, "done");
-                    return Ok(());
-                }
-                continue;
-            }
-            for (call_id, output) in results {
-                self.context.push(Role::Tool(call_id), output);
-            }
+            self.stream_reply().await?;
         }
-        Err("model did not finish within 5 steps".into())
     }
 
-    /// Stream one model reply into a new assistant message and return the
-    /// tool calls it made.
-    async fn stream_reply(
-        &mut self,
-    ) -> Result<Vec<ChatCompletionMessageToolCalls>, Box<dyn Error>> {
+    /// Stream one model reply into a new assistant message, tool calls
+    /// included.
+    async fn stream_reply(&mut self) -> Result<(), Error> {
+        let system = ChatCompletionRequestSystemMessage::from(self.system_prompt.as_str());
+        let mut messages = vec![system.into()];
+        messages.extend(self.context.request());
         let request = CreateChatCompletionRequestArgs::default()
-            .model(&self.model)
-            .messages(
-                std::iter::once(
-                    ChatCompletionRequestSystemMessage::from(self.system_prompt.as_str()).into(),
-                )
-                .chain(self.context.messages().iter().cloned().map(Into::into))
-                .collect::<Vec<_>>(),
-            )
-            .tools(
-                self.tools
-                    .iter()
-                    .map(|(tool, _)| ChatCompletionTools::Function(tool.clone()))
-                    .collect::<Vec<_>>(),
-            )
+            .model(self.model.as_str())
+            .messages(messages)
+            .tools(self.tools.definitions())
             .build()?;
         debug!(messages = %serde_json::to_string(&request.messages)?, "request");
         let mut stream = self.client.chat().create_stream(request).await?;
 
         let index = self.context.push(Role::Assistant, "");
-        // Models imitate what they see, so a reply may start with a made-up
-        // `<metadata>` tag. The start of the reply is held back until it's
-        // clear, and a tag is dropped.
+        // Models imitate what they see, and every message they see starts
+        // with a `<metadata>` tag. So the start of the reply is held back
+        // until it's clear whether it's one, and a tag is dropped.
         let mut held = Some(String::new());
-        let mut calls: Vec<ChatCompletionMessageToolCall> = Vec::new();
+        let mut release = |text: String| -> String {
+            let Some(start) = held.as_mut() else {
+                return text;
+            };
+            start.push_str(&text);
+            if METADATA.starts_with(start.as_str()) {
+                return String::new(); // could still become a tag
+            }
+            if start.starts_with(METADATA) {
+                // A tag ends with `/>` and its line.
+                let Some(end) = start.find("/>\n") else {
+                    return String::new();
+                };
+                start.drain(..end + 3);
+            }
+            held.take().unwrap_or_default()
+        };
+        let mut calls: Vec<Call> = Vec::new();
 
         while let Some(chunk) = stream.next().await {
-            for choice in chunk?.choices {
-                if let Some(mut text) = choice.delta.content {
-                    if let Some(start) = held.as_mut() {
-                        start.push_str(&text);
-                        if METADATA.starts_with(start.as_str()) {
-                            continue; // could still become a tag
-                        }
-                        if start.starts_with(METADATA) {
-                            // A tag ends with `/>` and its line.
-                            let Some(end) = start.find("/>\n").map(|i| i + 3) else {
-                                continue;
-                            };
-                            start.drain(..end);
-                        }
-                        text = held.take().unwrap_or_default();
-                    }
-                    self.context
-                        .update(|messages| messages[index].content.push_str(&text));
+            // A reply cut off partway would stay in the context for good and
+            // go out with every later request, so it's removed instead.
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    let mut before = self.context.messages().to_vec();
+                    before.truncate(index);
+                    self.context.replace(before);
+                    return Err(e.into());
+                }
+            };
+            for choice in chunk.choices {
+                if let Some(text) = choice.delta.content {
+                    self.context.append(index, &release(text));
                 }
                 // Each piece names the call it belongs to by index.
                 for piece in choice.delta.tool_calls.unwrap_or_default() {
@@ -254,26 +323,16 @@ impl Session {
                         call.id = id;
                     }
                     if let Some(function) = piece.function {
-                        call.function.name += &function.name.unwrap_or_default();
-                        call.function.arguments += &function.arguments.unwrap_or_default();
+                        call.name += &function.name.unwrap_or_default();
+                        call.arguments += &function.arguments.unwrap_or_default();
                     }
                 }
             }
         }
-        if let Some(text) = held.filter(|text| !text.is_empty()) {
-            self.context
-                .update(|messages| messages[index].content.push_str(&text));
-        }
+        // A reply that only ever looked like the start of a tag is text.
+        self.context.append(index, &held.unwrap_or_default());
+        self.context.edit(index, |m| m.tool_calls = calls);
         info!(text = %self.context.messages()[index].content, "assistant");
-
-        let calls: Vec<_> = calls
-            .into_iter()
-            .map(ChatCompletionMessageToolCalls::Function)
-            .collect();
-        // Setting no calls changes nothing, so no patch is published.
-        let tool_calls = calls.clone();
-        self.context
-            .update(|messages| messages[index].tool_calls = tool_calls);
-        Ok(calls)
+        Ok(())
     }
 }

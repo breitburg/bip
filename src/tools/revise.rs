@@ -1,17 +1,18 @@
-use crate::context::{Context, Message, Role};
-use crate::tools::Outcome;
-use async_openai::types::chat::ChatCompletionMessageToolCalls;
+use crate::context::{Context, Message, Role, frozen_from};
+use crate::agent::Agent;
+use crate::tools::{Error, Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::error::Error;
 
 /// Revise the conversation: remove or rewrite earlier messages with `edits`, then continue
 /// the conversation from right after `resume_from`. Everything after that
 /// message is dropped, including the request that led to this call and this
 /// call itself, so the conversation reads as if it had always been this way.
 ///
-/// If `resume_from` is a user message, you reply to it afresh. If it's one of
-/// your own messages, the turn ends there. When the person asks you to change
+/// If `resume_from` is a message to you, from the person or another agent,
+/// you reply to it afresh. If it's one of
+/// your own messages, the turn ends there, unless that message called tools:
+/// then its results stay and you go on after them. When the person asks you to change
 /// the conversation, apply the change and resume from the message just before
 /// their request.
 ///
@@ -21,7 +22,7 @@ use std::error::Error;
 /// current turn can't be edited. Edits apply in order, and if any fails,
 /// nothing changes.
 #[derive(Deserialize, JsonSchema)]
-pub struct Revise {
+pub struct Args {
     /// Changes to make, in order. May be empty, to only rewind.
     edits: Vec<Operation>,
     /// The ID of an existing message to continue from, after the edits. It
@@ -47,24 +48,33 @@ enum Operation {
     Rewrite { id: String, blocks: String },
 }
 
-pub fn revise(args: Revise, context: &mut Context) -> Result<Outcome, Box<dyn Error>> {
+/// Lets an agent edit and rewind its own conversation.
+pub struct Revise;
+
+impl Tool for Revise {
+    const NAME: &'static str = "revise";
+    type Args = Args;
+
+    async fn call(&self, args: Args, agent: &mut Agent) -> Result<String, Error> {
+        revise(args, &mut agent.context)
+    }
+}
+
+fn revise(args: Args, context: &mut Context) -> Result<String, Error> {
     let messages = context.messages();
-    let current = context.current.as_deref();
 
     // Check the resume point before touching anything.
-    let resume_index = find(messages, current, &args.resume_from)?;
+    let resume_index = find(messages, &args.resume_from)?;
     let resume_from = messages[resume_index].id.clone();
-    // The person's latest message is what led to this call. Resuming from it
-    // unchanged would only replay the same request, so it's allowed only when
-    // this call rewrites it.
-    let request = messages[..current
-        .and_then(|id| messages.iter().position(|m| m.id == id))
-        .unwrap_or(messages.len())]
+    // The latest message to this agent, from the person or another agent, is
+    // what led to this call. Resuming from it unchanged would only replay the
+    // same request, so it's allowed only when this call rewrites it.
+    let request = messages[..frozen_from(messages).unwrap_or(messages.len())]
         .iter()
-        .rposition(|m| matches!(m.role, Role::User));
+        .rposition(|m| m.role != Role::Assistant);
     let rewrites_request = args.edits.iter().any(|operation| {
         matches!(operation, Operation::Rewrite { id, .. }
-            if find(messages, current, id).ok() == Some(resume_index))
+            if find(messages, id).ok() == Some(resume_index))
     });
     if request == Some(resume_index) && !rewrites_request {
         return Err(format!(
@@ -81,28 +91,11 @@ pub fn revise(args: Revise, context: &mut Context) -> Result<Outcome, Box<dyn Er
     for operation in args.edits {
         summary.push(match operation {
             Operation::Remove { id } => {
-                let index = find(&draft, current, &id)?;
-                let removed = draft.remove(index);
-                // A tool result can't outlive the call it answers, so removing
-                // an assistant message also removes the results of its calls.
-                let call_ids: Vec<&str> = removed
-                    .tool_calls
-                    .iter()
-                    .filter_map(|call| match call {
-                        ChatCompletionMessageToolCalls::Function(call) => Some(call.id.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                let mut ids = vec![removed.id.clone()];
-                while let Some(index) = draft.iter().position(|m| {
-                    matches!(&m.role, Role::Tool(call_id) if call_ids.contains(&call_id.as_str()))
-                }) {
-                    ids.push(draft.remove(index).id);
-                }
-                format!("removed {}", ids.join(", "))
+                let index = find(&draft, &id)?;
+                format!("removed {}", draft.remove(index).id)
             }
             Operation::Rewrite { id, blocks } => {
-                let index = find(&draft, current, &id)?;
+                let index = find(&draft, &id)?;
                 let message = &mut draft[index];
                 for block in blocks.split(">>>>>>> REPLACE").filter(|b| !b.trim().is_empty()) {
                     let Some((search, replace)) = block
@@ -124,23 +117,22 @@ pub fn revise(args: Revise, context: &mut Context) -> Result<Outcome, Box<dyn Er
         });
     }
 
-    if !draft.iter().any(|m| m.id == resume_from) {
+    // Rewind: drop everything after the resume point. That includes the reply
+    // making this call, so the result below has no call left to belong to.
+    let Some(index) = draft.iter().position(|m| m.id == resume_from) else {
         return Err(format!("these edits remove {resume_from}, the message to resume from").into());
-    }
-
-    context.update(|messages| *messages = draft);
-    summary.push(format!("resuming from {resume_from}"));
-    Ok(Outcome {
-        text: format!("Done: {}.", summary.join(", ")),
-        resume_from: Some(resume_from),
-    })
+    };
+    draft.truncate(index + 1);
+    context.replace(draft);
+    summary.push(format!("resumed from {resume_from}"));
+    Ok(format!("Done: {}.", summary.join(", ")))
 }
 
 /// Find the message the model means by `reference` in `messages`, if it may be
-/// edited: messages from `current` on are the current turn. Models are sloppy,
-/// so this accepts `<AB12CD>`, `[ab12cd]`, `id="AB12CD"`, and so on: the first
-/// run of exactly 6 letters or digits, ignoring case.
-fn find(messages: &[Message], current: Option<&str>, reference: &str) -> Result<usize, String> {
+/// edited. Models are sloppy, so this accepts `<AB12CD>`, `[ab12cd]`,
+/// `id="AB12CD"`, and so on: the first run of exactly 6 letters or digits,
+/// ignoring case.
+fn find(messages: &[Message], reference: &str) -> Result<usize, String> {
     let wanted = reference
         .split(|c: char| !c.is_ascii_alphanumeric())
         .find(|part| part.len() == 6)
@@ -150,12 +142,7 @@ fn find(messages: &[Message], current: Option<&str>, reference: &str) -> Result<
         .iter()
         .position(|m| m.id == wanted)
         .ok_or_else(|| format!("no message with ID {reference:?}"))?;
-    // Tool results have no visible ID, so the model can only have guessed it.
-    if matches!(messages[index].role, Role::Tool(_)) {
-        return Err(format!("no message with ID {reference:?}"));
-    }
-    let current = current.and_then(|id| messages.iter().position(|m| m.id == id));
-    if current.is_some_and(|current| index >= current) {
+    if frozen_from(messages).is_some_and(|frozen| index >= frozen) {
         return Err(format!(
             "{wanted} is part of the current turn and can't be edited"
         ));

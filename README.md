@@ -39,23 +39,47 @@ The two directions have separate message types.
 
 | `type`    | `data` | Meaning                                    |
 |-----------|--------|--------------------------------------------|
-| `message` | string | A message for Bip from the person at this client. |
-| `clear`   | none   | Remove every message from Bip's context. Bip publishes this as a normal `change`. |
+| `message` | `{"text"}` | A message for Bip from the person at this client. |
+| `clear`   | none   | Remove every message from Bip's context, and stop and clear every subagent. It takes effect at once, even in the middle of a reply. |
 
 ```json
-{"type": "message", "data": "Hey Bip!"}
+{"type": "message", "data": {"text": "Hey Bip!"}}
 {"type": "clear"}
 ```
 
 Bip handles messages one at a time, in the order they arrive, across all
-clients.
+clients. A message that arrives while Bip is replying waits for the reply to
+end.
 
 ### Bip → client
 
 | `type`   | `data` | Meaning |
 |----------|--------|---------|
-| `change` | array  | A [JSON Patch](https://www.rfc-editor.org/rfc/rfc6902) to Bip's context. |
-| `error`  | string | Something went wrong. Bip keeps running. |
+| `change` | `{"agent", "patch"}` | A [JSON Patch](https://www.rfc-editor.org/rfc/rfc6902) to one agent's context. |
+| `error`  | `{"agent", "message"}` | Something went wrong in that agent's turn. It keeps running. |
+| `finished` | `{"agent"}` | That agent is gone, done or stopped. Nothing more will come from it. |
+| `cleared` | none | A `clear` is complete: `main` is empty and every subagent is gone, so clients can forget their contexts. |
+
+#### Agents
+
+Bip can start subagents with its `spawn` tool. A subagent works on its task in
+the background, with its own context, and when it finishes its final reply
+is added to the primary agent's context as a report. The primary agent then
+responds to it.
+
+Bip can also run Luau code with its `lua` tool. Each agent has its own
+runtime, and globals persist between calls until a `clear`. The runtime is
+sandboxed: only the `string`, `table`, `math`, `utf8`, `bit32` and `buffer`
+libraries, no files, processes or network, 10 seconds per call and 64 MB in
+all. Scripts can read the agent's own conversation through the `context`
+global.
+
+Every output names the agent it belongs to: `main` for the primary agent, and
+`sub-1`, `sub-2`, ... for subagents, in the order they started. Clients get
+every agent's changes, so they can show what each one is doing. Each agent's
+context is separate and starts empty. Messages from clients go only to `main`.
+A subagent starts as soon as `spawn` is called. When it finishes, or a `clear`
+stops it, Bip sends `finished` for it: it's gone, and so is its context.
 
 Bip doesn't send "replies". It streams changes to its context, the
 conversation it sees, as JSON Patches. The system prompt (`system.md`) isn't
@@ -69,7 +93,8 @@ The context starts as:
 {"messages": {}, "order": []}
 ```
 
-Applying every `change` to it in order gives exactly the context Bip has.
+Applying an agent's `change`s to it in order gives exactly that agent's
+context.
 `messages` maps each message's ID to the message, and `order` lists the IDs in
 conversation order. Messages are keyed by ID so that inserting or removing one
 doesn't resend the messages after it. No change ever carries the whole
@@ -92,29 +117,33 @@ falls far behind (256 outputs) misses the ones it couldn't keep up with.
   "role": "assistant",
   "content": "Hey Ilia! What's up?",
   "time": "2026-11-22T01:47:53.964114Z",
-  "tool_calls": []
+  "tool_calls": [
+    {"id": "call_1", "name": "spawn", "arguments": "{\"task\": \"...\"}", "result": "Started subagent sub-1."}
+  ]
 }
 ```
 
 - `id`: 6 characters, unique within the context and stable for the message's
   life.
-- `role`: `"user"`, `"assistant"`, or `{"tool": "<tool call id>"}`
-  for a tool's result.
+- `role`: `"user"`, `"assistant"`, or `{"agent": "sub-1"}` for a message from
+  another agent: a subagent's report, or the task a subagent was given.
 - `time`: when the message joined the context.
-- `tool_calls`: tools the assistant called in this message, as in the OpenAI
-  Chat Completions API.
+- `tool_calls`: tools the assistant called in this message. `arguments` is
+  the JSON text the model wrote. `result` is `null` while the tool runs, then
+  the text it returned. A result is part of its call, not a message of its
+  own.
 
 #### Example
 
 Bip starts a reply, then streams its text:
 
 ```json
-{"type": "change", "data": [
+{"type": "change", "data": {"agent": "main", "patch": [
   {"op": "add", "path": "/messages/0E9258", "value": {"id": "0E9258", "role": "assistant", "content": "", "time": "...", "tool_calls": []}},
   {"op": "add", "path": "/order/2", "value": "0E9258"}
-]}
-{"type": "change", "data": [{"op": "replace", "path": "/messages/0E9258/content", "value": "Hey Ilia"}]}
-{"type": "change", "data": [{"op": "replace", "path": "/messages/0E9258/content", "value": "Hey Ilia! What's up?"}]}
+]}}
+{"type": "change", "data": {"agent": "main", "patch": [{"op": "replace", "path": "/messages/0E9258/content", "value": "Hey Ilia"}]}}
+{"type": "change", "data": {"agent": "main", "patch": [{"op": "replace", "path": "/messages/0E9258/content", "value": "Hey Ilia! What's up?"}]}}
 ```
 
 JSON Patch has no operation for adding to a string, so each streamed piece

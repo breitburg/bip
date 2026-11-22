@@ -1,52 +1,77 @@
+pub mod lua;
 pub mod revise;
+pub mod spawn;
 
-use crate::context::Context;
-use async_openai::types::chat::{ChatCompletionTool, FunctionObject};
+use crate::agent::Agent;
+use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
+use futures::{FutureExt, future::BoxFuture};
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
-use std::error::Error;
+use std::sync::Arc;
 
-/// A tool definition paired with the function that runs it on the model's
-/// raw JSON arguments.
-pub type Tool = (
-    ChatCompletionTool,
-    Box<dyn Fn(&str, &mut Context) -> Result<Outcome, Box<dyn Error>> + Send + Sync>,
-);
+/// The error type everywhere: it can cross threads, so tasks can hold it.
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-/// What a tool hands back to the agent.
-pub struct Outcome {
-    /// What to tell the model.
-    pub text: String,
-    /// Continue the conversation from right after this message: everything
-    /// after it, including the current turn, is dropped.
-    pub resume_from: Option<String>,
+/// Something the model can call. A tool takes its arguments and returns text
+/// for the model; where that text goes, and what happens next, is the
+/// agent's business.
+pub trait Tool: Send + Sync + 'static {
+    const NAME: &'static str;
+    /// What the model fills in. Its doc comment and field docs become the
+    /// tool's description and schema.
+    type Args: JsonSchema + DeserializeOwned + Send;
+
+    /// Run on the agent that called it.
+    fn call(
+        &self,
+        args: Self::Args,
+        agent: &mut Agent,
+    ) -> impl Future<Output = Result<String, Error>> + Send;
 }
 
-/// Most tools only have text to report.
-impl From<String> for Outcome {
-    fn from(text: String) -> Self {
-        Outcome {
-            text,
-            resume_from: None,
-        }
+/// A `Tool` with its argument type hidden, so tools of different types fit
+/// in one list.
+trait Erased: Send + Sync {
+    fn call<'a>(&'a self, arguments: &'a str, agent: &'a mut Agent) -> BoxFuture<'a, Result<String, Error>>;
+}
+
+impl<T: Tool> Erased for T {
+    fn call<'a>(&'a self, arguments: &'a str, agent: &'a mut Agent) -> BoxFuture<'a, Result<String, Error>> {
+        async move { Tool::call(self, serde_json::from_str(arguments)?, agent).await }.boxed()
     }
 }
 
-/// Build a tool from `run`. The model fills in `T`; its doc comment and field
-/// docs become the description and schema.
-pub fn tool<T: JsonSchema + DeserializeOwned + 'static>(
-    name: &str,
-    run: fn(T, &mut Context) -> Result<Outcome, Box<dyn Error>>,
-) -> Tool {
-    let mut schema = serde_json::to_value(schema_for!(T)).unwrap();
-    let function = FunctionObject {
-        name: name.into(),
-        description: schema["description"].as_str().map(Into::into),
-        parameters: Some(schema.take()),
-        strict: None,
-    };
-    (
-        ChatCompletionTool { function },
-        Box::new(move |arguments, context| run(serde_json::from_str(arguments)?, context)),
-    )
+/// The tools an agent has. Cloning is cheap, so agents can share them.
+#[derive(Clone, Default)]
+pub struct Tools(Arc<Vec<(ChatCompletionTool, Arc<dyn Erased>)>>);
+
+impl Tools {
+    pub fn with<T: Tool>(mut self, tool: T) -> Self {
+        let mut schema = serde_json::to_value(schema_for!(T::Args)).expect("a schema is JSON");
+        let function = FunctionObject {
+            name: T::NAME.into(),
+            description: schema["description"].as_str().map(Into::into),
+            parameters: Some(schema.take()),
+            strict: None,
+        };
+        Arc::make_mut(&mut self.0).push((ChatCompletionTool { function }, Arc::new(tool)));
+        self
+    }
+
+    /// The tools as a model request lists them.
+    pub fn definitions(&self) -> Vec<ChatCompletionTools> {
+        let definitions = self.0.iter().map(|(definition, _)| definition.clone());
+        definitions.map(ChatCompletionTools::Function).collect()
+    }
+
+    /// Run the tool `name` on the model's raw JSON `arguments`. The model
+    /// reads the result either way, so a failure comes back as text too.
+    pub async fn call(&self, name: &str, arguments: &str, agent: &mut Agent) -> String {
+        let tool = self.0.iter().find(|(tool, _)| tool.function.name == name);
+        let result = match tool {
+            Some((_, tool)) => tool.call(arguments, agent).await,
+            None => Err(format!("unknown tool: {name}").into()),
+        };
+        result.unwrap_or_else(|e| format!("error: {e}"))
+    }
 }
