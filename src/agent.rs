@@ -1,5 +1,5 @@
 use crate::context::{Call, Context, METADATA, Role};
-use crate::tools::{Error, Tools};
+use crate::tools::{self, Error, Tools};
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -234,10 +234,9 @@ impl Agent {
         loop {
             while let Some(call) = self.context.pending_call().cloned() {
                 info!(tool = %call.name, arguments = %call.arguments, "tool call");
-                // Tools are shared handles, so a copy lets the tool borrow the
-                // whole agent.
-                let tools = self.tools.clone();
-                let result = tools.call(&call.name, &call.arguments, self).await;
+                // A copy of the list, so the tool can borrow the whole agent.
+                let list = self.tools.clone();
+                let result = tools::call(&list, &call.name, &call.arguments, self).await;
                 info!(tool = %call.name, %result, "tool result");
                 self.context.resolve(&call.id, result);
             }
@@ -267,7 +266,7 @@ impl Agent {
         let request = CreateChatCompletionRequestArgs::default()
             .model(self.model.as_str())
             .messages(messages)
-            .tools(self.tools.definitions())
+            .tools(self.tools.iter().map(|tool| tool.definition()).collect::<Vec<_>>())
             .build()?;
         debug!(messages = %serde_json::to_string(&request.messages)?, "request");
         let mut stream = self.client.chat().create_stream(request).await?;

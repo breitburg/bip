@@ -29,24 +29,17 @@ pub trait Tool: Send + Sync + 'static {
     ) -> impl Future<Output = Result<String, Error>> + Send;
 }
 
-/// A `Tool` with its argument type hidden, so tools of different types fit
-/// in one list.
-trait Erased: Send + Sync {
+/// Any `Tool`, with its argument type hidden, so tools of different types
+/// fit in one list.
+pub trait AnyTool: Send + Sync {
+    /// The tool as a model request lists it.
+    fn definition(&self) -> ChatCompletionTools;
+    fn name(&self) -> &'static str;
     fn call<'a>(&'a self, arguments: &'a str, agent: &'a mut Agent) -> BoxFuture<'a, Result<String, Error>>;
 }
 
-impl<T: Tool> Erased for T {
-    fn call<'a>(&'a self, arguments: &'a str, agent: &'a mut Agent) -> BoxFuture<'a, Result<String, Error>> {
-        async move { Tool::call(self, serde_json::from_str(arguments)?, agent).await }.boxed()
-    }
-}
-
-/// The tools an agent has. Cloning is cheap, so agents can share them.
-#[derive(Clone, Default)]
-pub struct Tools(Arc<Vec<(ChatCompletionTool, Arc<dyn Erased>)>>);
-
-impl Tools {
-    pub fn with<T: Tool>(mut self, tool: T) -> Self {
+impl<T: Tool> AnyTool for T {
+    fn definition(&self) -> ChatCompletionTools {
         let mut schema = serde_json::to_value(schema_for!(T::Args)).expect("a schema is JSON");
         let function = FunctionObject {
             name: T::NAME.into(),
@@ -54,24 +47,27 @@ impl Tools {
             parameters: Some(schema.take()),
             strict: None,
         };
-        Arc::make_mut(&mut self.0).push((ChatCompletionTool { function }, Arc::new(tool)));
-        self
+        ChatCompletionTools::Function(ChatCompletionTool { function })
     }
 
-    /// The tools as a model request lists them.
-    pub fn definitions(&self) -> Vec<ChatCompletionTools> {
-        let definitions = self.0.iter().map(|(definition, _)| definition.clone());
-        definitions.map(ChatCompletionTools::Function).collect()
+    fn name(&self) -> &'static str {
+        T::NAME
     }
 
-    /// Run the tool `name` on the model's raw JSON `arguments`. The model
-    /// reads the result either way, so a failure comes back as text too.
-    pub async fn call(&self, name: &str, arguments: &str, agent: &mut Agent) -> String {
-        let tool = self.0.iter().find(|(tool, _)| tool.function.name == name);
-        let result = match tool {
-            Some((_, tool)) => tool.call(arguments, agent).await,
-            None => Err(format!("unknown tool: {name}").into()),
-        };
-        result.unwrap_or_else(|e| format!("error: {e}"))
+    fn call<'a>(&'a self, arguments: &'a str, agent: &'a mut Agent) -> BoxFuture<'a, Result<String, Error>> {
+        async move { Tool::call(self, serde_json::from_str(arguments)?, agent).await }.boxed()
     }
+}
+
+/// The tools an agent has.
+pub type Tools = Vec<Arc<dyn AnyTool>>;
+
+/// Run the tool `name` from `tools` on the model's raw JSON `arguments`. The
+/// model reads the result either way, so a failure comes back as text too.
+pub async fn call(tools: &[Arc<dyn AnyTool>], name: &str, arguments: &str, agent: &mut Agent) -> String {
+    let result = match tools.iter().find(|tool| tool.name() == name) {
+        Some(tool) => tool.call(arguments, agent).await,
+        None => Err(format!("unknown tool: {name}").into()),
+    };
+    result.unwrap_or_else(|e| format!("error: {e}"))
 }

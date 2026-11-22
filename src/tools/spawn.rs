@@ -7,21 +7,17 @@ use serde::Deserialize;
 /// The call returns at once with the subagent's ID. When the subagent
 /// finishes, its final reply arrives as a message from it, marked with its ID.
 ///
-/// The subagent starts with an empty conversation and can't start subagents
-/// of its own. It sees nothing of this conversation, so `task` must hold
-/// everything it needs to know.
+/// The subagent starts with an empty conversation and no tools. It sees
+/// nothing of this conversation, so `task` must hold everything it needs to
+/// know.
 #[derive(Deserialize, JsonSchema)]
 pub struct Args {
     /// The complete instructions for the subagent.
     task: String,
 }
 
-/// Lets an agent start subagents, which run with `tools`. Leave `Spawn` out
-/// of `tools`, as the description above promises the model, unless that
-/// changes too.
-pub struct Spawn {
-    pub tools: Tools,
-}
+/// Lets an agent start subagents.
+pub struct Spawn;
 
 impl Tool for Spawn {
     const NAME: &'static str = "spawn";
@@ -38,7 +34,7 @@ impl Tool for Spawn {
             agent.model.clone(),
             agent.system_prompt.clone(),
             agent.outputs.clone(),
-            self.tools.clone(),
+            Tools::new(),
             Some(agent.inbox.clone()),
         );
         let from = Some(agent.name.clone());

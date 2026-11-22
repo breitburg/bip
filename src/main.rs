@@ -48,11 +48,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_api_base(std::env::var("OPENAI_BASE_URL")?)
         .with_api_key(std::env::var("OPENAI_API_KEY")?);
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
-    // Subagents may revise their own context but not start subagents.
-    let subagent_tools = Tools::default().with(Revise).with(Lua);
-    let tools = Tools::default().with(Revise).with(Lua).with(Spawn {
-        tools: subagent_tools,
-    });
+    let tools: Tools = vec![Arc::new(Revise), Arc::new(Lua), Arc::new(Spawn)];
     let (main, inputs) = Agent::new(
         "main".into(),
         Client::with_config(config),
