@@ -263,11 +263,13 @@ impl Agent {
         let system = ChatCompletionRequestSystemMessage::from(self.system_prompt.as_str());
         let mut messages = vec![system.into()];
         messages.extend(self.context.request());
-        let request = CreateChatCompletionRequestArgs::default()
-            .model(self.model.as_str())
-            .messages(messages)
-            .tools(self.tools.iter().map(|tool| tool.definition()).collect::<Vec<_>>())
-            .build()?;
+        let mut request = CreateChatCompletionRequestArgs::default();
+        request.model(self.model.as_str()).messages(messages);
+        // The API rejects an empty list, so an agent without tools sends none.
+        if !self.tools.is_empty() {
+            request.tools(self.tools.iter().map(|tool| tool.definition()).collect::<Vec<_>>());
+        }
+        let request = request.build()?;
         debug!(messages = %serde_json::to_string(&request.messages)?, "request");
         let mut stream = self.client.chat().create_stream(request).await?;
 
