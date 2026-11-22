@@ -1,5 +1,5 @@
 use crate::agent::{Agent, Input};
-use crate::interface::Interface;
+use crate::interface::{Functions, Interface};
 
 const DOCS: &str = "\
 `agents` starts and stops subagents.
@@ -14,39 +14,51 @@ const DOCS: &str = "\
   at once. It's gone, with its own subagents, and sends no report. Returns
   whether it was still running.";
 
-/// Lets an agent start subagents.
-pub fn interface() -> Interface {
-    Interface::new("agents", DOCS)
-        .function("spawn", |_, agent, task: String| {
-            let name = agent.swarm.new_name();
-            // Another agent with the same setup, running in the background. Its
-            // last reply comes back as a message from it.
-            let (child, inputs) = Agent::new(
-                name.clone(),
-                agent.client.clone(),
-                agent.model.clone(),
-                agent.system_prompt.clone(),
-                agent.outputs.clone(),
-                Vec::new(),
-                Some(agent.name.clone()),
-                agent.swarm.clone(),
-            );
-            let from = Some(agent.name.clone());
-            if let Some(inbox) = agent.swarm.inbox(&name) {
-                let _ = inbox.try_send(Input::Message { text: task, from });
-            }
-            agent.swarm.started(&name, tokio::spawn(child.run(inputs)));
-            Ok(name)
-        })
-        .function("stop", |_, agent, name: String| {
-            // A finished subagent has left the swarm, so it's not found and
-            // wasn't running.
-            if agent.swarm.inbox(&name).is_none() {
-                return Ok(false);
-            }
-            if !agent.swarm.descends_from(&name, &agent.name) {
-                return Err(format!("{name} isn't a subagent of yours").into());
-            }
-            Ok(agent.swarm.kill(&name))
-        })
+/// Lets an agent start and stop subagents.
+pub struct Agents;
+
+impl Interface for Agents {
+    fn name(&self) -> &'static str {
+        "agents"
+    }
+
+    fn docs(&self) -> &'static str {
+        DOCS
+    }
+
+    fn functions(&self, functions: &mut Functions) {
+        functions
+            .add("spawn", |_, agent, task: String| {
+                let name = agent.swarm.new_name();
+                // Another agent with the same setup, running in the background. Its
+                // last reply comes back as a message from it.
+                let (child, inputs) = Agent::new(
+                    name.clone(),
+                    agent.client.clone(),
+                    agent.model.clone(),
+                    agent.system_prompt.clone(),
+                    agent.outputs.clone(),
+                    Vec::new(),
+                    Some(agent.name.clone()),
+                    agent.swarm.clone(),
+                );
+                let from = Some(agent.name.clone());
+                if let Some(inbox) = agent.swarm.inbox(&name) {
+                    let _ = inbox.try_send(Input::Message { text: task, from });
+                }
+                agent.swarm.started(&name, tokio::spawn(child.run(inputs)));
+                Ok(name)
+            })
+            .add("stop", |_, agent, name: String| {
+                // A finished subagent has left the swarm, so it's not found and
+                // wasn't running.
+                if agent.swarm.inbox(&name).is_none() {
+                    return Ok(false);
+                }
+                if !agent.swarm.descends_from(&name, &agent.name) {
+                    return Err(format!("{name} isn't a subagent of yours").into());
+                }
+                Ok(agent.swarm.kill(&name))
+            });
+    }
 }

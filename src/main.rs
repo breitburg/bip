@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "claude-sonnet-5-5".into(),
         std::fs::read_to_string("system.md")?,
         output_tx,
-        vec![interface::context::interface(), interface::agents::interface()],
+        vec![Arc::new(interface::Context), Arc::new(interface::Agents)],
         None,
         swarm.clone(),
     );

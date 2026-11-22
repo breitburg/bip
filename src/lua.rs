@@ -1,9 +1,10 @@
 use crate::agent::Agent;
-use crate::interface::{AGENT, Error, Interface};
+use crate::interface::{self, AGENT, Error, Interface};
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
 use mlua::{LuaOptions, MultiValue, StdLib, Value, VmState};
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long one run may take before it's stopped.
@@ -34,14 +35,14 @@ struct Args {
 
 /// The tool as a model request lists it: how to run Luau, then how to use
 /// each of `interfaces`.
-pub fn definition(interfaces: &[Interface]) -> ChatCompletionTools {
+pub fn definition(interfaces: &[Arc<dyn Interface>]) -> ChatCompletionTools {
     let mut description = DOCS.to_string();
     if !interfaces.is_empty() {
         description += "\n\nEverything else you can do is through these globals.";
     }
     for interface in interfaces {
         description += "\n\n";
-        description += interface.docs;
+        description += interface.docs();
     }
     let function = FunctionObject {
         name: NAME.into(),
@@ -83,7 +84,7 @@ struct Deadline(Instant);
 struct Printed(String);
 
 /// A new sandboxed runtime for one agent, with its `interfaces` as globals.
-fn start(interfaces: &[Interface]) -> Result<mlua::Lua, Error> {
+fn start(interfaces: &[Arc<dyn Interface>]) -> Result<mlua::Lua, Error> {
     let libs =
         StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::UTF8 | StdLib::BIT | StdLib::BUFFER;
     let lua = mlua::Lua::new_with(libs, LuaOptions::default())?;
@@ -105,7 +106,7 @@ fn start(interfaces: &[Interface]) -> Result<mlua::Lua, Error> {
     })?;
     lua.globals().set("print", print)?;
     for interface in interfaces {
-        interface.install(&lua)?;
+        interface::install(interface.as_ref(), &lua)?;
     }
     // From here on the built-in globals are read-only, and what scripts
     // set goes to a table of their own that persists between runs.
@@ -161,4 +162,35 @@ fn truncate(output: &str) -> String {
         &output[..end],
         output.len() - end
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interface::Context;
+    use crate::swarm::Swarm;
+    use async_openai::{Client, config::OpenAIConfig};
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn scripts_reach_only_their_interfaces() {
+        let (outputs, _received) = mpsc::unbounded_channel();
+        let client = Client::with_config(OpenAIConfig::new());
+        let interfaces: Vec<Arc<dyn Interface>> = vec![Arc::new(Context)];
+        let (mut agent, _inputs) = Agent::new(
+            "main".into(),
+            client,
+            String::new(),
+            String::new(),
+            outputs,
+            interfaces,
+            None,
+            Swarm::default(),
+        );
+        assert_eq!(call(&mut agent, r#"{"code": "context.count()"}"#), "0");
+        let missing = call(&mut agent, r#"{"code": "agents.spawn('x')"}"#);
+        assert!(missing.starts_with("error"), "{missing}");
+        let readonly = call(&mut agent, r#"{"code": "context.count = nil"}"#);
+        assert!(readonly.starts_with("error"), "{readonly}");
+    }
 }

@@ -49,87 +49,43 @@ has two of them.
 
 Subagents can run Luau but have no interfaces.
 
-### Scripts
-
-These are scripts an agent might send to `lua`. A script that is a single
-expression returns its value, and `print` output comes back too.
-
-Globals persist between calls, so an agent can keep state around.
-
-```lua
-notes = notes or {}
-table.insert(notes, "Prefers short answers")
-return #notes
-```
-
-Work can be split across subagents. `spawn` returns at once, and each report
-arrives later as a message from that subagent.
-
-```lua
-local names = {}
-for _, language in {"French", "German", "Japanese"} do
-  table.insert(names, agents.spawn("Translate into " .. language .. ": The meeting moved to Friday."))
-end
-return names
-```
-
-An agent can read its own conversation.
-
-```lua
-local asked = 0
-for _, m in context.messages() do
-  if m.role == "user" then asked += 1 end
-end
-return asked
-```
-
-It can also rewrite it. This removes one message, fixes a word in another,
-and continues from right after a third, as if everything after it never
-happened.
-
-```lua
-context.revise{
-  edits = {
-    {action = "remove", id = "8468AF"},
-    {action = "rewrite", id = "0E9258", blocks = [[
-<<<<<<< SEARCH
-Paris
-=======
-Lyon
->>>>>>> REPLACE
-]]},
-  },
-  resume_from = "1B2C3D",
-}
-```
-
 ### Adding an interface
 
-An interface is a name, docs for the model, and a function per entry. Each
-function gets the runtime, the calling agent and the script's arguments. The
-docs are added to the `lua` tool's description, which is how the model learns
-the interface exists. See `src/interface.rs`.
+An interface is a type that implements `Interface`. It has a name, docs for
+the model, and the functions scripts can call. Each function gets the
+runtime, the calling agent and the script's arguments. The docs are added to
+the `lua` tool's description, which is how the model learns the interface
+exists. See `src/interface.rs`.
 
 This one lets scripts read the time.
 
 ```rust
 // src/interface/clock.rs
-use crate::interface::Interface;
+use crate::interface::{Functions, Interface};
 
-const DOCS: &str = "\
-`clock` tells the time.
+pub struct Clock;
 
-- `clock.now()`: the current UTC time, like `2026-11-22T19:32:10Z`.";
+impl Interface for Clock {
+    fn name(&self) -> &'static str {
+        "clock"
+    }
 
-pub fn interface() -> Interface {
-    Interface::new("clock", DOCS)
-        .function("now", |_, _, ()| Ok(chrono::Utc::now().format("%FT%TZ").to_string()))
+    fn docs(&self) -> &'static str {
+        "`clock.now()` returns the current UTC time, like `2026-11-22T19:32:10Z`."
+    }
+
+    fn functions(&self, functions: &mut Functions) {
+        functions.add("now", |_, _, ()| Ok(chrono::Utc::now().format("%FT%TZ").to_string()));
+    }
 }
 ```
 
-Declare it with `pub mod clock;` in `src/interface.rs` and add
-`interface::clock::interface()` to `main`'s list in `src/main.rs`. Scripts can
-then call `clock.now()`.
+Add `pub mod clock;` to `src/interface.rs`, then list it with the others
+where `main` is created in `src/main.rs`.
+
+```rust
+vec![Arc::new(interface::Context), Arc::new(interface::Agents), Arc::new(interface::clock::Clock)]
+```
 
 ## Protocol
 

@@ -1,5 +1,5 @@
-use crate::context::{Context, Message, Role, TIME_FORMAT, frozen_from};
-use crate::interface::{Error, Interface};
+use crate::context::{self, Message, Role, TIME_FORMAT, frozen_from};
+use crate::interface::{Error, Functions, Interface};
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 use serde::Deserialize;
 
@@ -48,24 +48,40 @@ that ID.
   edited.";
 
 /// Lets an agent read its own conversation, and edit and rewind it.
-pub fn interface() -> Interface {
-    Interface::new("context", DOCS)
-        .function("count", |_, agent, ()| Ok(agent.context.messages().len()))
-        .function("message", |lua, agent, index: usize| {
-            let message = index.checked_sub(1).and_then(|i| agent.context.messages().get(i));
-            Ok(message.map(|m| table(lua, m)).transpose()?)
-        })
-        .function("messages", |lua, agent, ()| {
-            let messages = agent.context.messages().iter().map(|m| table(lua, m));
-            Ok(lua.create_sequence_from(messages.collect::<mlua::Result<Vec<_>>>()?)?)
-        })
-        .function("find", |_, agent, id: String| {
-            let mut messages = agent.context.messages().iter();
-            Ok(messages.position(|m| m.id.eq_ignore_ascii_case(&id)).map(|i| i + 1))
-        })
-        .function("revise", |lua, agent, args: Value| {
-            revise(lua.from_value(args)?, &mut agent.context)
-        })
+pub struct Context;
+
+impl Interface for Context {
+    fn name(&self) -> &'static str {
+        "context"
+    }
+
+    fn docs(&self) -> &'static str {
+        DOCS
+    }
+
+    fn functions(&self, functions: &mut Functions) {
+        functions
+            .add("count", |_, agent, ()| Ok(agent.context.messages().len()))
+            .add("message", |lua, agent, index: usize| {
+                let message = index
+                    .checked_sub(1)
+                    .and_then(|i| agent.context.messages().get(i));
+                Ok(message.map(|m| table(lua, m)).transpose()?)
+            })
+            .add("messages", |lua, agent, ()| {
+                let messages = agent.context.messages().iter().map(|m| table(lua, m));
+                Ok(lua.create_sequence_from(messages.collect::<mlua::Result<Vec<_>>>()?)?)
+            })
+            .add("find", |_, agent, id: String| {
+                let mut messages = agent.context.messages().iter();
+                Ok(messages
+                    .position(|m| m.id.eq_ignore_ascii_case(&id))
+                    .map(|i| i + 1))
+            })
+            .add("revise", |lua, agent, args: Value| {
+                revise(lua.from_value(args)?, &mut agent.context)
+            });
+    }
 }
 
 /// A message as a script sees it.
@@ -124,7 +140,7 @@ enum Operation {
     Rewrite { id: String, blocks: String },
 }
 
-fn revise(args: Args, context: &mut Context) -> Result<String, Error> {
+fn revise(args: Args, context: &mut context::Context) -> Result<String, Error> {
     let messages = context.messages();
 
     // Check the resume point before touching anything.

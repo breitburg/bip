@@ -11,6 +11,7 @@ use futures::{FutureExt, StreamExt, future::BoxFuture};
 use json_patch::Patch;
 use serde_json::json;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, info, info_span, warn};
 
@@ -60,7 +61,7 @@ pub struct Agent {
     /// Where everything this agent does goes, for clients to show.
     pub outputs: mpsc::UnboundedSender<Output>,
     /// What this agent's scripts can reach outside their sandbox.
-    pub interfaces: Vec<Interface>,
+    pub interfaces: Vec<Arc<dyn Interface>>,
     pub context: Context,
     /// This agent's Luau runtime, started by its first script.
     pub lua: Option<mlua::Lua>,
@@ -102,7 +103,7 @@ impl Agent {
         model: String,
         system_prompt: String,
         outputs: mpsc::UnboundedSender<Output>,
-        interfaces: Vec<Interface>,
+        interfaces: Vec<Arc<dyn Interface>>,
         parent: Option<String>,
         swarm: Swarm,
     ) -> (Self, mpsc::Receiver<Input>) {
