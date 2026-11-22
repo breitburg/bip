@@ -13,137 +13,120 @@ far. `static/index.html` is a playground for testing.
 
 ## Running
 
-Create a `.env` file:
+Put the model endpoint in `.env`. It must support Chat Completions with
+streaming and tool calls.
 
 ```
 OPENAI_API_KEY=...
 OPENAI_BASE_URL=https://.../v1
 ```
 
-The endpoint must support Chat Completions with streaming and tool calls.
-Then:
+Then run `cargo run` and open http://127.0.0.1:8765. `RUST_LOG` sets the log
+level, for example `RUST_LOG=bip=debug`. The default is `info`.
 
-```
-cargo run
-```
+## Agents
 
-and open http://127.0.0.1:8765 in a browser. Set `RUST_LOG` (for example
-`RUST_LOG=bip=debug`) to change how much is logged; the default is `info`.
+The primary agent is called `main` and always exists. Subagents get a
+6-character ID like `4C1D7A`. No two running agents share a name. Each agent
+has its own context, which starts empty. The system prompt in `system.md` is
+sent with every request but isn't part of the context.
+
+The only tool is `lua`. Each agent gets its own Luau runtime, and globals
+persist between calls until a reset. The sandbox has the `string`, `table`,
+`math`, `utf8`, `bit32` and `buffer` libraries and nothing else. There's no
+file, process or network access. A call may run for 10 seconds, and an
+agent's runtime may use 64 MB.
+
+Interfaces are global tables of Rust functions that scripts can call. `main`
+has two of them.
+
+- `context` reads the agent's own conversation with `context.messages()`, and
+  edits or rewinds it with `context.revise{...}`.
+- `agents.spawn(task)` starts a subagent in the background and returns its
+  name. When the subagent finishes, its last reply arrives in the parent's
+  context as a message from it, and the parent responds. `agents.stop(name)`
+  stops a subagent early, and then it sends no report.
+
+Subagents can run Luau but have no interfaces.
+
+An interface is a name, docs for the model, and a function per entry. Each
+function gets the runtime, the calling agent and the script's arguments. See
+`src/interface.rs`.
+
+```rust
+Interface::new("agents", DOCS).function("spawn", |_, agent, task: String| { ... })
+```
 
 ## Protocol
 
-Bip serves the files in `static/` over HTTP on `http://127.0.0.1:8765`, and
-the protocol on the WebSocket endpoint `ws://127.0.0.1:8765/ws`. Every WebSocket message, in either
-direction, is a JSON text frame of the form:
+Every message in either direction is JSON.
 
 ```json
 {"type": "<type>", "data": <payload>}
 ```
 
-The two directions have separate message types.
+Over WebSocket, the endpoint is `ws://127.0.0.1:8765/ws` and each message is
+a text frame. The same server serves `static/` over HTTP.
 
-### Client → Bip
+### Commands
 
-Clients control the whole swarm, not only `main`: `message` and `stop` name
-the agent they're for in `agent`, and go to `main` when they name none.
+`message` and `stop` take an optional `agent`. Without one they go to `main`.
 
-| `type`    | `data` | Meaning                                    |
-|-----------|--------|--------------------------------------------|
-| `message` | `{"text", "agent"?}` | A message for that agent from the person at this client. |
-| `stop`    | `{"agent"?}` or none | Stop what that agent is doing: its reply ends where it is, and every subagent it started is stopped, with no report. The context is kept, with what the agent had said so far. Messages that were waiting for the reply join the context unanswered; the agent answers them with the next message. A stopped subagent then finishes, and reports what it had said, marked `(stopped)`. |
-| `clear`   | none   | Remove every message from `main`'s context, and stop and remove every subagent. It takes effect at once, even in the middle of a reply. |
+| `type`    | `data` | Effect |
+|-----------|--------|--------|
+| `message` | `{"text", "agent"?}` | Sends the agent a message from the person at this client. |
+| `stop`    | `{"agent"?}` or none | Ends the agent's reply where it is and kills its subagents without reports. The context is kept. Messages queued during the reply are added but not answered until the next message. A stopped subagent finishes and reports what it had said, marked `(stopped)`. |
+| `reset`   | none   | Empties `main`'s context, drops its Lua runtime, and kills every subagent along with their runtimes. |
 
 ```json
 {"type": "message", "data": {"text": "Hey Bip!"}}
 {"type": "message", "data": {"text": "Focus on the tests", "agent": "4C1D7A"}}
 {"type": "stop"}
 {"type": "stop", "data": {"agent": "0B3E95"}}
-{"type": "clear"}
+{"type": "reset"}
 ```
 
-A `stop` or a `clear` takes effect as soon as the agent is not inside a
-script, so at most 10 seconds later. A command for an agent that doesn't
-exist, or has finished, gets an `error` back, to the client that sent it only.
+`stop` and `reset` interrupt a reply, but wait for a running script to end,
+which takes at most 10 seconds. A command for an agent that doesn't exist
+gets an `error` back, sent only to that client.
 
-Each agent handles messages one at a time, in the order they arrive, across
-all clients. A message that arrives while it's replying waits for the reply
-to end.
+Each agent handles messages one at a time, in arrival order, across all
+clients. A message that arrives during a reply waits for it to end.
 
-### Bip → client
+### Outputs
 
-| `type`   | `data` | Meaning |
-|----------|--------|---------|
-| `change` | `{"agent", "patch"}` | A [JSON Patch](https://www.rfc-editor.org/rfc/rfc6902) to one agent's context. |
-| `error`  | `{"agent", "message"}` | Something went wrong in that agent's turn. It keeps running. |
-| `finished` | `{"agent"}` | That agent is gone, done or stopped. Nothing more will come from it. |
-| `cleared` | none | A `clear` is complete: `main` is empty and every subagent is gone, so clients can forget their contexts. |
+| `type`     | `data` | Meaning |
+|------------|--------|---------|
+| `change`   | `{"agent", "patch"}` | A [JSON Patch](https://www.rfc-editor.org/rfc/rfc6902) to the agent's context. |
+| `error`    | `{"agent", "message"}` | The agent's turn failed. The agent keeps running. |
+| `finished` | `{"agent"}` | The agent is gone, along with its context. Nothing more comes from it. |
+| `reset`    | none | The reset is done. `main` is empty and every subagent is gone. |
 
-#### Agents
+A subagent sends `finished` when it completes, or when `stop`, `agents.stop`
+or `reset` ends it.
 
-Bip has exactly one tool, `lua`, which runs Luau code. Each agent has its
-own runtime, and globals persist between calls until a `clear`. The runtime
-is sandboxed: only the `string`, `table`, `math`, `utf8`, `bit32` and
-`buffer` libraries, no files, processes or network, 10 seconds per call and
-64 MB in all.
+Every client gets every output, except an `error` about invalid input, which
+goes only to the client that sent it. A new client first gets a replay of
+everything sent so far, then live outputs. A client that falls 256 outputs
+behind loses the ones it missed.
 
-Everything else Bip can do, it does from a script, through interfaces:
-global tables of functions that reach outside the sandbox. The primary agent
-has two:
+### Context
 
-- `context`: read its own conversation (`context.messages()`), and edit and
-  rewind it (`context.revise{...}`).
-- `agents`: `agents.spawn(task)` starts a subagent. It works on its task in
-  the background, with its own context, and when it finishes its final reply
-  is added to the primary agent's context as a report. The primary agent then
-  responds to it. A subagent can run Luau too, but has no interfaces.
-  `agents.stop(name)` stops one it started before it finishes; it then sends
-  no report.
+There are no reply messages. Bip streams changes to each agent's context as
+JSON Patches using `add`, `remove` and `replace`. New messages, streamed
+text and the agent's own edits all arrive this way, at any time.
 
-An interface is defined in Rust as a name, the documentation the model reads,
-and a function per entry, each given the runtime, the calling agent and the
-script's arguments (see `src/interface.rs`):
-
-```rust
-Interface::new("agents", DOCS).function("spawn", |_, agent, task: String| { ... })
-```
-
-Every output names the agent it belongs to: `main` for the primary agent, and
-a 6-character ID, like a message's (`4C1D7A`), for each subagent. Clients get
-every agent's changes, so they can show what each one is doing. Each agent's
-context is separate and starts empty. Clients can message and stop any agent
-by name. No two running agents share a name.
-A subagent starts as soon as `agents.spawn` is called. When it finishes, or a `clear`,
-a `stop` or `agents.stop` stops it, Bip sends `finished` for it: it's gone, and so is its context.
-
-Bip doesn't send "replies". It streams changes to its context, the
-conversation it sees, as JSON Patches. The system prompt (`system.md`) isn't
-part of the context, so it never appears here. A new message, each streamed piece of
-Bip's reply, and Bip editing its own history all arrive the same way. Bip only
-uses the `add`, `remove` and `replace` operations.
-
-The context starts as:
+A context starts as
 
 ```json
 {"messages": {}, "order": []}
 ```
 
-Applying an agent's `change`s to it in order gives exactly that agent's
-context.
-`messages` maps each message's ID to the message, and `order` lists the IDs in
-conversation order. Messages are keyed by ID so that inserting or removing one
-doesn't resend the messages after it. No change ever carries the whole
-conversation.
+and applying an agent's `change`s in order rebuilds it. `messages` maps IDs
+to messages and `order` lists the IDs in conversation order. Keying by ID
+means inserting or removing a message doesn't resend the ones after it.
 
-When a client connects, Bip first replays every output sent so far, so the
-client can rebuild the context from the empty state above. After that, outputs
-arrive live. The stream is always on: there's no "reply finished" message, and
-Bip may change its context at any time, not only after a message.
-
-Every connected client receives every output. The exception is an `error`
-about invalid input, which goes only to the client that sent it. A client that
-falls far behind (256 outputs) misses the ones it couldn't keep up with.
-
-#### Messages
+A message looks like this.
 
 ```json
 {
@@ -157,19 +140,14 @@ falls far behind (256 outputs) misses the ones it couldn't keep up with.
 }
 ```
 
-- `id`: 6 characters, unique within the context and stable for the message's
-  life.
-- `role`: `"user"`, `"assistant"`, or `{"agent": "4C1D7A"}` for a message from
-  another agent: a subagent's report, or the task a subagent was given.
-- `time`: when the message joined the context.
-- `tool_calls`: tools the assistant called in this message; the only tool is
-  `lua`. `arguments` is the JSON text the model wrote. `result` is `null` while the tool runs, then
-  the text it returned. A result is part of its call, not a message of its
-  own.
+- `id` is 6 characters, unique in the context, and never changes.
+- `role` is `"user"`, `"assistant"`, or `{"agent": "4C1D7A"}` for a subagent's
+  task or report.
+- `time` is when the message joined the context.
+- `tool_calls` lists the `lua` calls in the message. `arguments` is the JSON
+  the model wrote. `result` is `null` while the script runs, then its output.
 
-#### Example
-
-Bip starts a reply, then streams its text:
+A streamed reply looks like this.
 
 ```json
 {"type": "change", "data": {"agent": "main", "patch": [
@@ -180,8 +158,8 @@ Bip starts a reply, then streams its text:
 {"type": "change", "data": {"agent": "main", "patch": [{"op": "replace", "path": "/messages/0E9258/content", "value": "Hey Ilia! What's up?"}]}}
 ```
 
-JSON Patch has no operation for adding to a string, so each streamed piece
-replaces the message's whole `content`.
+JSON Patch can't append to a string, so each piece replaces the whole
+`content`.
 
 ## License
 

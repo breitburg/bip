@@ -57,7 +57,7 @@ pub fn definition(interfaces: &[Interface]) -> ChatCompletionTools {
 }
 
 /// Run the code in the model's raw JSON `arguments` on `agent`, in a runtime
-/// of its own that lasts until a clear. The model reads the result either
+/// of its own that lasts until a reset. The model reads the result either
 /// way, so a failure comes back as text too.
 pub fn call(agent: &mut Agent, arguments: &str) -> String {
     let result = (|| {

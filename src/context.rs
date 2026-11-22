@@ -168,7 +168,7 @@ impl Context {
     }
 
     /// Swap in a whole new conversation. This compares everything, so it's
-    /// for the rare wholesale change, like a rewind or a clear.
+    /// for the rare wholesale change, like a rewind or a reset.
     pub fn replace(&mut self, messages: Vec<Message>) {
         let before = self.to_json();
         self.messages = messages;

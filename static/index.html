@@ -17,14 +17,14 @@ input { flex: 1; }
 <input id="input" autocomplete="off" autofocus>
 <button>Send</button>
 <button type="button" id="stop">Stop</button>
-<button type="button" id="clear">Clear</button>
+<button type="button" id="reset">Reset</button>
 </form>
 <script>
 const status = document.getElementById("status");
 const list = document.getElementById("messages");
 const form = document.getElementById("form");
 const input = document.getElementById("input");
-const clear = document.getElementById("clear");
+const reset = document.getElementById("reset");
 const stop = document.getElementById("stop");
 const target = document.getElementById("target");
 
@@ -102,7 +102,7 @@ form.onsubmit = (event) => {
   send({ type: "message", data: { text, agent: target.value } });
   input.value = "";
 };
-clear.onclick = () => send({ type: "clear" });
+reset.onclick = () => send({ type: "reset" });
 stop.onclick = () => send({ type: "stop", data: { agent: target.value } });
 
 function connect() {
@@ -126,7 +126,7 @@ function connect() {
     } else if (output.type === "finished") {
       delete agents[output.data.agent];
       scheduleRender();
-    } else if (output.type === "cleared") {
+    } else if (output.type === "reset") {
       agents = {};
       scheduleRender();
     } else if (output.type === "error") {

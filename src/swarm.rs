@@ -23,7 +23,7 @@ pub enum Command {
     /// stays.
     Stop(#[serde(default)] Option<Target>),
     /// Empty `main` and remove every subagent.
-    Clear,
+    Reset,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -66,9 +66,9 @@ impl Swarm {
         let (agent, input) = match command {
             Command::Message { text, agent } => (agent, Input::Message { text, from: None }),
             Command::Stop(target) => (target.map_or_else(main, |t| t.agent), Input::Stop),
-            // `main` clears, because it's what keeps the conversation the
-            // clear empties.
-            Command::Clear => (main(), Input::Clear),
+            // `main` resets, because it's what keeps the conversation the
+            // reset empties.
+            Command::Reset => (main(), Input::Reset),
         };
         let inbox = self.inbox(&agent).ok_or_else(|| format!("no agent named {agent:?}"))?;
         inbox.send(input).await.map_err(|_| format!("{agent} has finished"))
@@ -182,6 +182,6 @@ mod tests {
             Command::Stop(Some(Target { agent })) if agent == MAIN));
         assert!(matches!(parse(r#"{"type":"stop","data":{"agent":"0B3E95"}}"#),
             Command::Stop(Some(Target { agent })) if agent == "0B3E95"));
-        assert!(matches!(parse(r#"{"type":"clear"}"#), Command::Clear));
+        assert!(matches!(parse(r#"{"type":"reset"}"#), Command::Reset));
     }
 }

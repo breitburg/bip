@@ -29,9 +29,9 @@ pub enum Output {
     Error { agent: String, message: String },
     /// This agent is gone, done or stopped. Nothing more will come from it.
     Finished { agent: String },
-    /// A `clear` is complete: `main` is empty and every subagent is gone, so
+    /// A `reset` is complete: `main` is empty and every subagent is gone, so
     /// their conversations can be forgotten.
-    Cleared,
+    Reset,
 }
 
 /// What an agent accepts, through its inbox in the swarm. Clients' commands
@@ -41,9 +41,10 @@ pub enum Input {
     /// A message for this agent: from a person, or from the agent named in
     /// `from`, like a subagent reporting back.
     Message { text: String, from: Option<String> },
-    /// Remove every message from the context, and stop and clear every
-    /// subagent. Unlike a message, this doesn't wait for the turn to end.
-    Clear,
+    /// Remove every message from the context, drop the Lua runtime, and stop
+    /// and remove every subagent. Unlike a message, this doesn't wait for the
+    /// turn to end.
+    Reset,
     /// Stop what this agent is doing, at once: its turn ends where it is, and
     /// its subagents are stopped. The context stays as it is.
     Stop,
@@ -160,8 +161,8 @@ impl Agent {
                     Input::Message { text, from } => {
                         self.context.push(from.map_or(Role::User, Role::Agent), text);
                     }
-                    Input::Clear => {
-                        self.clear().await;
+                    Input::Reset => {
+                        self.reset().await;
                         continue;
                     }
                     Input::Stop => {
@@ -171,7 +172,7 @@ impl Agent {
                     }
                 }
 
-                // A clear or a stop ends the turn where it is; dropping `turn`
+                // A reset or a stop ends the turn where it is; dropping `turn`
                 // does that.
                 let result = {
                     let turn = self.respond();
@@ -180,7 +181,7 @@ impl Agent {
                         tokio::select! {
                             result = &mut turn => break Ok(result),
                             input = inputs.recv() => match input {
-                                Some(interrupt @ (Input::Clear | Input::Stop)) => break Err(interrupt),
+                                Some(interrupt @ (Input::Reset | Input::Stop)) => break Err(interrupt),
                                 Some(message) => queued.push_back(message),
                                 None => {} // only `main` can lose its senders
                             },
@@ -212,9 +213,9 @@ impl Agent {
                         Ending::Stopped
                     }
                     Err(_) => {
-                        // Messages from before the clear are cleared with it.
+                        // Messages from before the reset go with it.
                         queued.clear();
-                        self.clear().await;
+                        self.reset().await;
                         Ending::Replied
                     }
                 };
@@ -260,15 +261,15 @@ impl Agent {
         }
     }
 
-    async fn clear(&mut self) {
-        info!("clearing context");
-        // Only `main` is sent a clear, and it clears the whole swarm. Wait
-        // until the subagents are really gone, so `Cleared` comes after
+    async fn reset(&mut self) {
+        info!("resetting");
+        // Only `main` is sent a reset, and it resets the whole swarm. Wait
+        // until the subagents are really gone, so `Reset` comes after
         // everything they sent.
         self.swarm.kill_subagents().await;
         self.context.replace(Vec::new());
         self.lua = None;
-        let _ = self.outputs.send(Output::Cleared);
+        let _ = self.outputs.send(Output::Reset);
     }
 
     /// Take the turn: run the tools the model called and call the model
