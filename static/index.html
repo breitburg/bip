@@ -28,10 +28,10 @@ const reset = document.getElementById("reset");
 const stop = document.getElementById("stop");
 const target = document.getElementById("target");
 
-// Each agent's context, by agent name, rebuilt from the JSON Patches Bip
-// streams. `main` is the primary agent; subagents are named by short IDs,
-// like `4C1D7A`.
-let agents;
+// The swarm document, rebuilt from the JSON Patches Bip streams. It holds
+// every running agent and its context under `agents`, by name: `main`, and
+// short IDs like `4C1D7A` for subagents.
+let swarm = { agents: {} };
 
 // Apply one JSON Patch (RFC 6902) operation to `state`. Bip only sends add,
 // remove and replace.
@@ -51,7 +51,7 @@ function apply(state, op) {
 
 // Offer every running agent as a target, keeping the choice while it runs.
 function renderTargets() {
-  const names = ["main", ...Object.keys(agents).filter((a) => a !== "main")];
+  const names = ["main", ...Object.keys(swarm.agents).filter((a) => a !== "main")];
   const chosen = names.includes(target.value) ? target.value : "main";
   target.replaceChildren(...names.map((name) => new Option(name, name)));
   target.value = chosen;
@@ -60,9 +60,9 @@ function renderTargets() {
 function render() {
   renderTargets();
   list.innerHTML = "";
-  for (const [agent, state] of Object.entries(agents)) {
+  for (const [agent, state] of Object.entries(swarm.agents)) {
     const heading = document.createElement("h3");
-    heading.textContent = agent;
+    heading.textContent = state.parent ? `${agent} (from ${state.parent})` : agent;
     list.appendChild(heading);
     for (const id of state.order) {
       const m = state.messages[id];
@@ -108,8 +108,8 @@ stop.onclick = () => send({ type: "stop", data: { agent: target.value } });
 function connect() {
   socket = new WebSocket(`ws://${location.host}/ws`);
   socket.onopen = () => {
-    // Bip replays every change to each new connection, so start empty.
-    agents = {};
+    // Bip starts each connection with a snapshot of the whole document.
+    swarm = { agents: {} };
     status.textContent = "connected";
   };
   socket.onclose = () => {
@@ -119,15 +119,7 @@ function connect() {
   socket.onmessage = (event) => {
     const output = JSON.parse(event.data);
     if (output.type === "change") {
-      const { agent, patch } = output.data;
-      agents[agent] ??= { messages: {}, order: [] };
-      for (const op of patch) apply(agents[agent], op);
-      scheduleRender();
-    } else if (output.type === "finished") {
-      delete agents[output.data.agent];
-      scheduleRender();
-    } else if (output.type === "reset") {
-      agents = {};
+      for (const op of output.data.patch) apply(swarm, op);
       scheduleRender();
     } else if (output.type === "error") {
       status.textContent = `error in ${output.data.agent}: ${output.data.message}`;

@@ -17,6 +17,7 @@ use axum::{
     routing::get,
 };
 use futures::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
@@ -32,9 +33,11 @@ struct Server {
     swarm: Swarm,
     /// Outputs as JSON text, serialized once for every client.
     outputs: broadcast::Sender<Utf8Bytes>,
-    /// Every output sent so far, so a client that connects later can replay
-    /// it and catch up. Cloning `Utf8Bytes` only copies a pointer.
-    history: Arc<Mutex<Vec<Utf8Bytes>>>,
+    /// The swarm document as it is now, with every change applied, so a
+    /// client that connects later can start from it. Outputs are broadcast
+    /// while it's locked, so a snapshot and the outputs after it never
+    /// overlap or leave a gap.
+    document: Arc<Mutex<Value>>,
 }
 
 #[tokio::main]
@@ -64,18 +67,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     swarm.started(MAIN, tokio::spawn(main.run(inputs)));
 
-    // Every connected client gets every output, so the agent's stream is
-    // fanned out through a broadcast channel and recorded in the history.
+    // Every connected client gets every output, so the agents' stream is
+    // fanned out through a broadcast channel, and every change is applied to
+    // the document.
     let server = Server {
         swarm,
         outputs: broadcast::channel(256).0,
-        history: Arc::default(),
+        document: Arc::new(Mutex::new(json!({"agents": {}}))),
     };
     let fan_out = server.clone();
     tokio::spawn(async move {
         while let Some(output) = output_rx.recv().await {
             let json = Utf8Bytes::from(serde_json::to_string(&output).unwrap());
-            fan_out.history.lock().unwrap().push(json.clone());
+            let mut document = fan_out.document.lock().unwrap();
+            if let Output::Change { patch } = &output
+                && let Err(e) = json_patch::patch(&mut document, patch)
+            {
+                warn!(error = %e, "a change didn't apply to the document");
+            }
             let _ = fan_out.outputs.send(json); // fails only when no one is connected
         }
     });
@@ -115,19 +124,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// One client: it sends `Command`s and receives every `Output` as JSON, starting
-/// with a replay of everything sent before it connected.
+/// The document as it is now, as a change that replaces a client's whole
+/// copy, and the outputs that come after it.
+fn snapshot(server: &Server) -> (Utf8Bytes, broadcast::Receiver<Utf8Bytes>) {
+    // Subscribing while holding the lock means no output is missed or
+    // applied twice between the snapshot and the live stream.
+    let document = server.document.lock().unwrap();
+    let agents = &document["agents"];
+    let change = json!({"type": "change", "data": {"patch": [
+        {"op": "replace", "path": "/agents", "value": agents},
+    ]}});
+    (change.to_string().into(), server.outputs.subscribe())
+}
+
+/// One client: it sends `Command`s and receives every `Output` as JSON,
+/// starting with a snapshot of the swarm document.
 async fn serve(socket: WebSocket, server: Server) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Subscribing while holding the lock means no output is missed or sent
-    // twice between the replay and the live stream.
-    let (replay, mut outputs) = {
-        let history = server.history.lock().unwrap();
-        (history.clone(), server.outputs.subscribe())
-    };
+    let (snapshot_json, mut outputs) = snapshot(&server);
     let (mut sink, mut source) = socket.split();
-    for json in replay {
-        sink.send(Message::Text(json)).await?;
-    }
+    sink.send(Message::Text(snapshot_json)).await?;
     loop {
         tokio::select! {
             message = source.next() => match message {
@@ -148,8 +163,13 @@ async fn serve(socket: WebSocket, server: Server) -> Result<(), Box<dyn Error + 
             },
             output = outputs.recv() => match output {
                 Ok(json) => sink.send(Message::Text(json)).await?,
+                // Changes it missed would leave its copy wrong, so it starts
+                // over from a new snapshot.
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(n, "client fell behind, outputs dropped");
+                    warn!(n, "client fell behind, sending a new snapshot");
+                    let (snapshot_json, live) = snapshot(&server);
+                    outputs = live;
+                    sink.send(Message::Text(snapshot_json)).await?;
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },

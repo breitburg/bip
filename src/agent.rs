@@ -1,4 +1,4 @@
-use crate::context::{Call, Context, METADATA, Role};
+use crate::context::{Call, Context, METADATA, Role, patch};
 use crate::interface::{Error, Interface};
 use crate::lua;
 use crate::swarm::Swarm;
@@ -9,6 +9,7 @@ use async_openai::{
 };
 use futures::{FutureExt, StreamExt, future::BoxFuture};
 use json_patch::Patch;
+use serde_json::json;
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, info, info_span, warn};
@@ -16,22 +17,18 @@ use tracing::{Instrument, debug, info, info_span, warn};
 /// How many times one turn may call the model before it's given up on.
 const MAX_STEPS: usize = 5;
 
-/// What the agent sends out. The stream never ends while the agent runs:
-/// it may say things on its own, not only in reply to an input.
+/// What agents send out. The stream never ends while Bip runs: agents may
+/// say things on their own, not only in reply to an input.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Output {
-    /// A change to one agent's context, as a JSON Patch. Applying an agent's
-    /// patches in order to `{"messages": {}, "order": []}` rebuilds its
-    /// conversation. The primary agent is `main`; subagents are named by short IDs, like `4C1D7A`.
-    Change { agent: String, patch: Patch },
+    /// A change to the swarm document, as a JSON Patch. It holds every
+    /// running agent under `agents`, by name: `main`, and short IDs like
+    /// `4C1D7A` for subagents. An agent is added when it starts and removed
+    /// when it's gone, and its context changes in between.
+    Change { patch: Patch },
     /// Something went wrong in one agent's turn. The agent keeps running.
     Error { agent: String, message: String },
-    /// This agent is gone, done or stopped. Nothing more will come from it.
-    Finished { agent: String },
-    /// A `reset` is complete: `main` is empty and every subagent is gone, so
-    /// their conversations can be forgotten.
-    Reset,
 }
 
 /// What an agent accepts, through its inbox in the swarm. Clients' commands
@@ -80,8 +77,8 @@ enum Ending {
     Stopped,
 }
 
-/// However an agent goes, by finishing or by being stopped, it says so as
-/// the last thing it does.
+/// However an agent goes, by finishing or by being stopped, it leaves the
+/// swarm document as the last thing it does.
 impl Drop for Agent {
     fn drop(&mut self) {
         // A stopped agent's subagents would otherwise run on with no one to
@@ -90,8 +87,9 @@ impl Drop for Agent {
             self.swarm.kill(&child);
         }
         self.swarm.leave(&self.name);
-        let agent = self.name.clone();
-        let _ = self.outputs.send(Output::Finished { agent });
+        let path = format!("/agents/{}", self.name);
+        let patch = patch(json!([{"op": "remove", "path": path}]));
+        let _ = self.outputs.send(Output::Change { patch });
     }
 }
 
@@ -110,10 +108,14 @@ impl Agent {
     ) -> (Self, mpsc::Receiver<Input>) {
         let (inbox, inputs) = mpsc::channel(8);
         swarm.join(&name, inbox, parent.clone());
-        let (agent, publish) = (name.clone(), outputs.clone());
-        let context = Context::new(move |patch| {
-            let agent = agent.clone();
-            let _ = publish.send(Output::Change { agent, patch });
+        // The agent's entry comes before anything it does.
+        let entry = json!({"parent": parent, "messages": {}, "order": []});
+        let path = format!("/agents/{name}");
+        let patch = patch(json!([{"op": "add", "path": path, "value": entry}]));
+        let _ = outputs.send(Output::Change { patch });
+        let publish = outputs.clone();
+        let context = Context::new(name.clone(), move |patch| {
+            let _ = publish.send(Output::Change { patch });
         });
         let agent = Self {
             name,
@@ -264,12 +266,11 @@ impl Agent {
     async fn reset(&mut self) {
         info!("resetting");
         // Only `main` is sent a reset, and it resets the whole swarm. Wait
-        // until the subagents are really gone, so `Reset` comes after
-        // everything they sent.
+        // until the subagents are really gone, so nothing they send comes
+        // after `main` is emptied.
         self.swarm.kill_subagents().await;
         self.context.replace(Vec::new());
         self.lua = None;
-        let _ = self.outputs.send(Output::Reset);
     }
 
     /// Take the turn: run the tools the model called and call the model

@@ -106,24 +106,28 @@ impl Message {
 
 /// The conversation the model sees.
 ///
-/// Every change is published as a JSON Patch against the context's JSON form:
+/// It lives in the swarm document under its agent's name, and every change
+/// is published as a JSON Patch against that document:
 ///
 /// ```json
-/// {"messages": {"0E9258": {...}}, "order": ["8468AF", "0E9258"]}
+/// {"agents": {"main": {"parent": null, "messages": {"0E9258": {...}}, "order": ["8468AF", "0E9258"]}}}
 /// ```
 ///
 /// Messages are keyed by ID rather than kept in a list, so inserting or
 /// removing one doesn't resend every message after it.
 pub struct Context {
+    /// The name of the agent it belongs to.
+    agent: String,
     messages: Vec<Message>,
     publish: Box<dyn Fn(Patch) + Send + Sync>,
 }
 
 impl Context {
-    /// An empty context: `{"messages": {}, "order": []}`. Every change from
-    /// now on goes to `publish` as a patch against the previous state.
-    pub fn new(publish: impl Fn(Patch) + Send + Sync + 'static) -> Self {
+    /// An empty context for `agent`, whose entry in the swarm document must
+    /// already exist. Every change from now on goes to `publish` as a patch.
+    pub fn new(agent: String, publish: impl Fn(Patch) + Send + Sync + 'static) -> Self {
         Self {
+            agent,
             messages: Vec::new(),
             publish: Box::new(publish),
         }
@@ -149,9 +153,10 @@ impl Context {
             tool_calls: Vec::new(),
         };
         let index = self.messages.len();
+        let root = format!("/agents/{}", self.agent);
         self.send(patch(json!([
-            {"op": "add", "path": format!("/messages/{}", message.id), "value": message},
-            {"op": "add", "path": format!("/order/{index}"), "value": message.id},
+            {"op": "add", "path": format!("{root}/messages/{}", message.id), "value": message},
+            {"op": "add", "path": format!("{root}/order/{index}"), "value": message.id},
         ])));
         self.messages.push(message);
         index
@@ -160,7 +165,8 @@ impl Context {
     /// Change one message. Only that message is compared to find what
     /// changed, so this is cheap enough to do for every streamed piece.
     pub fn edit<R>(&mut self, index: usize, change: impl FnOnce(&mut Message) -> R) -> R {
-        let alone = |m: &Message| json!({"messages": {m.id.as_str(): m}});
+        let agent = self.agent.as_str();
+        let alone = |m: &Message| json!({"agents": {agent: {"messages": {m.id.as_str(): m}}}});
         let before = alone(&self.messages[index]);
         let result = change(&mut self.messages[index]);
         self.send(json_patch::diff(&before, &alone(&self.messages[index])));
@@ -189,7 +195,7 @@ impl Context {
         }
         let message = &mut self.messages[index];
         message.content.push_str(text);
-        let path = format!("/messages/{}/content", message.id);
+        let path = format!("/agents/{}/messages/{}/content", self.agent, message.id);
         let operation = json!([{"op": "replace", "path": path, "value": message.content}]);
         self.send(patch(operation));
     }
@@ -227,7 +233,7 @@ impl Context {
             .map(|m| (m.id.clone(), json!(m)))
             .collect();
         let order: Vec<&str> = self.messages.iter().map(|m| m.id.as_str()).collect();
-        json!({ "messages": messages, "order": order })
+        json!({"agents": {self.agent.as_str(): {"messages": messages, "order": order}}})
     }
 }
 
@@ -255,8 +261,8 @@ pub fn frozen_from(messages: &[Message]) -> Option<usize> {
         .position(|m| m.tool_calls.iter().any(|call| call.result.is_none()))
 }
 
-/// A patch written out by hand. Its paths are built from message IDs and
-/// indexes, so it's always well formed.
-fn patch(operations: Value) -> Patch {
+/// A patch written out by hand. Its paths are built from agent names,
+/// message IDs and indexes, so it's always well formed.
+pub fn patch(operations: Value) -> Patch {
     serde_json::from_value(operations).expect("a well-formed patch")
 }

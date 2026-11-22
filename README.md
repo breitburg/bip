@@ -95,36 +95,40 @@ clients. A message that arrives during a reply waits for it to end.
 
 ### Outputs
 
-| `type`     | `data` | Meaning |
-|------------|--------|---------|
-| `change`   | `{"agent", "patch"}` | A [JSON Patch](https://www.rfc-editor.org/rfc/rfc6902) to the agent's context. |
-| `error`    | `{"agent", "message"}` | The agent's turn failed. The agent keeps running. |
-| `finished` | `{"agent"}` | The agent is gone, along with its context. Nothing more comes from it. |
-| `reset`    | none | The reset is done. `main` is empty and every subagent is gone. |
-
-A subagent sends `finished` when it completes, or when `stop`, `agents.stop`
-or `reset` ends it.
+| `type`   | `data` | Meaning |
+|----------|--------|---------|
+| `change` | `{"patch"}` | A [JSON Patch](https://www.rfc-editor.org/rfc/rfc6902) to the swarm document. |
+| `error`  | `{"agent", "message"}` | The agent's turn failed. The agent keeps running. |
 
 Every client gets every output, except an `error` about invalid input, which
-goes only to the client that sent it. A new client first gets a replay of
-everything sent so far, then live outputs. A client that falls 256 outputs
-behind loses the ones it missed.
+goes only to the client that sent it.
 
-### Context
+### Swarm document
 
-There are no reply messages. Bip streams changes to each agent's context as
-JSON Patches using `add`, `remove` and `replace`. New messages, streamed
-text and the agent's own edits all arrive this way, at any time.
-
-A context starts as
+There are no reply messages. Bip keeps one document describing the whole
+swarm and streams every change to it as a JSON Patch using `add`, `remove`
+and `replace`.
 
 ```json
-{"messages": {}, "order": []}
+{"agents": {
+  "main": {"parent": null, "messages": {}, "order": []},
+  "4C1D7A": {"parent": "main", "messages": {}, "order": []}
+}}
 ```
 
-and applying an agent's `change`s in order rebuilds it. `messages` maps IDs
-to messages and `order` lists the IDs in conversation order. Keying by ID
-means inserting or removing a message doesn't resend the ones after it.
+An agent is added under `agents` when it starts and removed when it's gone,
+whether it finished or was stopped. New messages, streamed text and the
+agent's own edits to its context all arrive as patches in between. A reset
+removes every subagent and empties `main`.
+
+A new client first gets a snapshot, a `change` that replaces `/agents` with
+its current value. Applying it and every later `change` to
+`{"agents": {}}` keeps the client's copy exact. A client that falls 256
+outputs behind gets a new snapshot.
+
+In a context, `messages` maps IDs to messages and `order` lists the IDs in
+conversation order. Keying by ID means inserting or removing a message
+doesn't resend the ones after it.
 
 A message looks like this.
 
@@ -150,12 +154,12 @@ A message looks like this.
 A streamed reply looks like this.
 
 ```json
-{"type": "change", "data": {"agent": "main", "patch": [
-  {"op": "add", "path": "/messages/0E9258", "value": {"id": "0E9258", "role": "assistant", "content": "", "time": "...", "tool_calls": []}},
-  {"op": "add", "path": "/order/2", "value": "0E9258"}
+{"type": "change", "data": {"patch": [
+  {"op": "add", "path": "/agents/main/messages/0E9258", "value": {"id": "0E9258", "role": "assistant", "content": "", "time": "...", "tool_calls": []}},
+  {"op": "add", "path": "/agents/main/order/2", "value": "0E9258"}
 ]}}
-{"type": "change", "data": {"agent": "main", "patch": [{"op": "replace", "path": "/messages/0E9258/content", "value": "Hey Ilia"}]}}
-{"type": "change", "data": {"agent": "main", "patch": [{"op": "replace", "path": "/messages/0E9258/content", "value": "Hey Ilia! What's up?"}]}}
+{"type": "change", "data": {"patch": [{"op": "replace", "path": "/agents/main/messages/0E9258/content", "value": "Hey Ilia"}]}}
+{"type": "change", "data": {"patch": [{"op": "replace", "path": "/agents/main/messages/0E9258/content", "value": "Hey Ilia! What's up?"}]}}
 ```
 
 JSON Patch can't append to a string, so each piece replaces the whole
